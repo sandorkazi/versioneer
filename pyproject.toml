@@ -1,0 +1,39 @@
+[project]
+name = "versioneer"
+version = "0.1.0"
+description = "Service-based file and config monitoring for Linux (CachyOS/Arch)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "click>=8",
+  "rich>=13",
+  "tomli-w>=1",
+]
+
+[project.scripts]
+versioneer = "versioneer.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/versioneer"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-cov>=5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=versioneer --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["versioneer"]
+relative_files = true
+
+[tool.coverage.report]
+exclude_also = ["raise SystemExit", "if TYPE_CHECKING:"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
