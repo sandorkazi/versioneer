@@ -14,6 +14,10 @@ from pathlib import Path
 VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 VALID_INTERVAL = re.compile(r"^(\d+[smh]|inotify)$|^\d+$")
 
+#: Store-side snapshot of the TOML, committed alongside artifacts so that
+#: `bootstrap <url>` can recreate exact TOML(s) on a fresh machine.
+SNAPSHOT_NAME = ".versioneer.toml"
+
 
 def config_dir() -> Path:
     override = os.environ.get("VERSIONEER_CONFIG_DIR")
@@ -64,6 +68,23 @@ def _valid_interval(v: str) -> bool:
     return bool(re.match(r"^\d+\s*[smh]$", v))
 
 
+#: Retention age forms accepted by store.parse_retention_age: 30d/5m/3h/10s/2w
+#: (case-insensitive), bare seconds, or positive ints. "inotify" is NOT valid here.
+_VALID_RETENTION_AGE = re.compile(r"^\s*(\d+)\s*([smhdwSMHDW])?\s*$")
+
+
+def _valid_retention_age(age: object) -> bool:
+    if isinstance(age, bool):
+        return False
+    if isinstance(age, (int, float)):
+        try:
+            return int(age) >= 1
+        except (ValueError, OverflowError):
+            return False
+    m = _VALID_RETENTION_AGE.match(str(age))
+    return bool(m) and int(m.group(1)) >= 1
+
+
 @dataclass
 class Target:
     path: str = ""
@@ -73,6 +94,9 @@ class Target:
     ignore: list[str] = field(default_factory=list)
     symlink: str = "preserve"
     flex: str = "fixed"
+    # interest: "state" = whole snapshot, "diff" = what changed. v1 deploys
+    # state in both cases; diff only adds unified-diff previews in
+    # status/diff/dry-run (true patch-apply is v2).
     interest: str = "state"
     deploy_path: str = ""
     owner: str = ""
@@ -84,6 +108,14 @@ class Target:
     retention: dict = field(default_factory=dict)
     template: bool = False
     on_deploy: str = ""
+    encrypt: bool = False
+    # Manifest subtable ([targets.manifest] in TOML): only for kind="manifest".
+    # {type: packages|wine|systemd|env, source: builtin id/cmd, output: fname}.
+    manifest: dict = field(default_factory=dict)
+    # Auto-add glob for dir targets (snippet/savegame style): untracked files
+    # matching this glob are candidates for `watch --auto-add` / bulk add.
+    # "" = disabled. Accepts True ("*") / False ("") for legacy bools.
+    auto_add_glob: str = ""
 
     def validate(self, meta_root: str = "") -> list[str]:
         errors: list[str] = []
@@ -104,10 +136,19 @@ class Target:
             if count is not None and (not isinstance(count, int) or count < 1):
                 errors.append(f"invalid retention.count {count!r}: must be int >= 1")
             age = self.retention.get("age")
-            if age is not None and not _valid_interval(str(age).replace(" ", "")) \
-                    and not re.match(r"^\d+\s*d$", str(age).strip()):
-                # age like "30d" allowed in addition to intervals
-                errors.append(f"invalid retention.age {age!r}: e.g. 30d")
+            if age is not None and not _valid_retention_age(age):
+                errors.append(f"invalid retention.age {age!r}: e.g. 30d, 5m, 3h, 2w")
+        if self.manifest:
+            if not isinstance(self.manifest, dict):
+                errors.append(f"invalid manifest {self.manifest!r}: must be a table")
+            elif self.kind != "manifest":
+                errors.append("manifest subtable requires kind='manifest'")
+            else:
+                mtype = self.manifest.get("type", "")
+                if mtype and mtype not in ("packages", "wine", "systemd", "env"):
+                    errors.append(f"invalid manifest.type {mtype!r}: packages|wine|systemd|env")
+        if self.auto_add_glob is not None and not isinstance(self.auto_add_glob, str):
+            errors.append(f"invalid auto_add_glob {self.auto_add_glob!r}: must be a glob string")
         return errors
 
     def to_dict(self) -> dict:
@@ -130,10 +171,39 @@ class Target:
             "retention": dict(self.retention),
             "template": self.template,
             "on_deploy": self.on_deploy,
+            "encrypt": self.encrypt,
+            "manifest": dict(self.manifest),
+            "auto_add_glob": self.auto_add_glob,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Target:
+        # [targets.manifest] subtable compat: tomllib nests it as
+        # {"manifest": {...}} under the last [[targets]] entry. Older/flat
+        # TOMLs may use manifest_type/manifest_kind strings or
+        # manifest_source/manifest_output keys — fold them in.
+        manifest: dict = {}
+        raw_manifest = data.get("manifest", {})
+        if isinstance(raw_manifest, dict):
+            manifest = dict(raw_manifest)
+        elif isinstance(raw_manifest, str) and raw_manifest.strip():
+            manifest = {"type": raw_manifest.strip()}
+        for flat_key, sub_key in (
+            ("manifest_type", "type"),
+            ("manifest_kind", "type"),
+            ("manifest_source", "source"),
+            ("manifest_output", "output"),
+        ):
+            if data.get(flat_key) and sub_key not in manifest:
+                manifest[sub_key] = data[flat_key]
+        # auto_add_glob compat: legacy bool True/False -> "*"/"".
+        raw_glob = data.get("auto_add_glob", "")
+        if isinstance(raw_glob, bool):
+            auto_add_glob = "*" if raw_glob else ""
+        elif raw_glob is None:
+            auto_add_glob = ""
+        else:
+            auto_add_glob = str(raw_glob)
         return cls(
             path=data.get("path", ""),
             abs_path=data.get("abs_path", ""),
@@ -153,6 +223,9 @@ class Target:
             retention=dict(data.get("retention", {})),
             template=bool(data.get("template", False)),
             on_deploy=data.get("on_deploy", ""),
+            encrypt=bool(data.get("encrypt", False)),
+            manifest=manifest,
+            auto_add_glob=auto_add_glob,
         )
 
 
@@ -174,16 +247,11 @@ class Config:
         return errors
 
 
-def load(name: str) -> Config:
-    """Load config by name, raising FileNotFoundError / ValueError."""
-    import tomllib
-
-    path = config_path(name)
-    with path.open("rb") as f:
-        data = tomllib.load(f)
+def _config_from_data(data: dict, default_name: str) -> Config:
+    """Build a Config from parsed TOML data (shared by load/load_snapshot)."""
     meta_data = data.get("meta", {})
     meta = Meta(
-        name=meta_data.get("name", name),
+        name=meta_data.get("name", default_name),
         upstream=meta_data.get("upstream", ""),
         root=meta_data.get("root", ""),
         storage=meta_data.get("storage", ""),
@@ -202,21 +270,17 @@ def load(name: str) -> Config:
     return Config(meta=meta, targets=targets)
 
 
-def save(config: Config) -> Path:
-    """Write config to disk, creating the config dir. Returns path."""
-    import tomli_w
-
-    errors = config.validate()
-    if errors:
-        raise ValueError("; ".join(errors))
-    d = config_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    path = config_path(config.meta.name)
-    targets_payload = [
-        t.to_dict() if isinstance(t, Target) else dict(t)  # type: ignore[union-attr]
-        for t in config.targets
-    ]
-    payload = {
+def _payload_for(config: Config) -> dict:
+    targets_payload = []
+    for t in config.targets:
+        d = t.to_dict() if isinstance(t, Target) else dict(t)  # type: ignore[union-attr]
+        # Omit empty manifest subtables: tomli_w renders {} as an empty
+        # [targets.manifest] block on every target, which is noisy and
+        # drifts from the docs (subtable only for kind="manifest").
+        if not d.get("manifest"):
+            d.pop("manifest", None)
+        targets_payload.append(d)
+    return {
         "meta": {
             "name": config.meta.name,
             "upstream": config.meta.upstream,
@@ -231,6 +295,68 @@ def save(config: Config) -> Path:
         },
         "targets": targets_payload,
     }
+
+
+def load(name: str) -> Config:
+    """Load config by name, raising FileNotFoundError / ValueError."""
+    import tomllib
+
+    path = config_path(name)
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    return _config_from_data(data, name)
+
+
+def snapshot_path(store: Path) -> Path:
+    """Path of the TOML snapshot inside a store repo."""
+    return Path(store) / SNAPSHOT_NAME
+
+
+def export_snapshot(config: Config, store: Path) -> Path:
+    """Write the full TOML payload into the store (for bootstrap).
+
+    Raises ValueError (validation) / OSError (I/O). Callers commit the
+    returned path and treat failures as warn-only where appropriate.
+    """
+    import tomli_w
+
+    errors = config.validate()
+    if errors:
+        raise ValueError("; ".join(errors))
+    store = Path(store)
+    store.mkdir(parents=True, exist_ok=True)
+    path = snapshot_path(store)
+    with path.open("wb") as f:
+        tomli_w.dump(_payload_for(config), f)
+    return path
+
+
+def load_snapshot(store: Path, default_name: str = "") -> Config | None:
+    """Read the store-side TOML snapshot, or None when absent/unreadable."""
+    import tomllib
+
+    path = snapshot_path(store)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        return _config_from_data(data, default_name or path.parent.name)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return None
+
+
+def save(config: Config) -> Path:
+    """Write config to disk, creating the config dir. Returns path."""
+    import tomli_w
+
+    errors = config.validate()
+    if errors:
+        raise ValueError("; ".join(errors))
+    d = config_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = config_path(config.meta.name)
+    payload = _payload_for(config)
     with path.open("wb") as f:
         tomli_w.dump(payload, f)
     return path

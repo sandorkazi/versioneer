@@ -17,7 +17,19 @@ while [[ $# -gt 0 ]]; do
     --venv) VENV_DIR="${2:?--venv needs a DIR}"; shift 2 ;;
     --no-completions) INSTALL_COMPLETIONS=0; shift ;;
     -h|--help)
-      echo "Usage: install.sh [--dev] [--venv DIR] [--no-completions]"
+      cat <<'EOF'
+Usage: install.sh [--dev] [--venv DIR] [--no-completions]
+
+Venv-only installer: creates/uses a venv (default
+~/.local/share/versioneer/venv, override with $VERSIONEER_VENV_DIR
+or --venv DIR) and installs versioneer into it (--dev = editable
+install). Never touches system python (no sudo pip, no
+--break-system-packages). Preflight requires python3 >= 3.12 and
+git; missing git-lfs is a warn-only. Installs bash/fish/zsh
+completions unless --no-completions. Upstreams are set later via
+`versioneer config create --upstream <url>`; systemd units via
+`versioneer service install`.
+EOF
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac

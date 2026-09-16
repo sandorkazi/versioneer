@@ -1,0 +1,157 @@
+"""ITEM 11: doctor + schema + small fixes.
+
+- unreachable upstream warns (ls-remote, timeout, warn-only) not crash
+- [targets.manifest] subtable read/write compat
+- ensure_lfs exact-line match + idempotent
+- auto_add_glob persists (+ interest=diff v1 state-deploy documented)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest import mock
+
+from click.testing import CliRunner
+
+from versioneer.cli import cli
+from versioneer.core import config as cfg
+from versioneer.core import store as store_mod
+
+
+def _make_config(runner: CliRunner, tmp_path: Path, name: str, upstream: str) -> Path:
+    store = tmp_path / f"store-{name}"
+    r = runner.invoke(
+        cli,
+        [
+            "config",
+            "create",
+            "--name",
+            name,
+            "--path",
+            str(store),
+            "--upstream",
+            upstream,
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    return store
+
+
+def test_doctor_unreachable_upstream_warns_not_crash(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    # Short probe timeout so the test stays fast offline.
+    monkeypatch.setenv("VERSIONEER_DOCTOR_TIMEOUT", "3")
+    runner = CliRunner()
+    _make_config(runner, tmp_path, "off", "git@example.invalid:foo/bar.git")
+    r = runner.invoke(cli, ["-C", "off", "doctor"])
+    # Warn-only: offline/unreachable must not crash and must not be an error.
+    assert r.exit_code == 0, r.output
+    assert "doctor:" in r.output
+    low = r.output.lower()
+    assert "unreachable" in low or "upstream" in low
+    assert "traceback" not in low
+
+
+def test_doctor_unreachable_upstream_mocked_warns(tmp_path, monkeypatch):
+    """Mocked ls-remote failure still warns (no crash, no error exit)."""
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    runner = CliRunner()
+    _make_config(runner, tmp_path, "mockoff", "git@example.invalid:foo/bar.git")
+    with mock.patch(
+        "versioneer.core.store.upstream_reachable",
+        return_value=(False, "upstream unreachable: mocked (warn-only, offline?)"),
+    ):
+        r = runner.invoke(cli, ["-C", "mockoff", "doctor"])
+    assert r.exit_code == 0, r.output
+    assert "unreachable" in r.output.lower()
+
+
+def test_manifest_subtable_loads(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    d = tmp_path / "cfg"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "wine.toml").write_text(
+        """[meta]
+name = "wine"
+storage = "/tmp/versioneer-store-wine"
+
+[[targets]]
+path = "wine-manifest.json"
+kind = "manifest"
+
+[targets.manifest]
+type = "wine"
+source = "builtin:wine"
+output = "wine-manifest.json"
+""",
+        encoding="utf-8",
+    )
+    c = cfg.load("wine")
+    assert len(c.targets) == 1
+    t = c.targets[0]
+    assert t.kind == "manifest"
+    assert isinstance(t.manifest, dict)
+    assert t.manifest.get("type") == "wine"
+    assert t.manifest.get("output") == "wine-manifest.json"
+    # Write compat: round-trip keeps the subtable, omits empties elsewhere.
+    saved = cfg.save(c)
+    text = saved.read_text(encoding="utf-8")
+    assert "[targets.manifest]" in text
+    assert "type" in text
+    c2 = cfg.load("wine")
+    assert c2.targets[0].manifest.get("type") == "wine"
+
+
+def test_manifest_flat_compat(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    # from_dict folds flat keys into the manifest subtable
+    t2 = cfg.Target.from_dict(
+        {"path": "packages.list", "kind": "manifest", "manifest_type": "packages"}
+    )
+    assert t2.manifest.get("type") == "packages"
+
+
+def test_ensure_lfs_exact_line_and_idempotent(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    with (
+        mock.patch("shutil.which", return_value="/usr/bin/git-lfs"),
+        mock.patch("versioneer.core.store._run_git", return_value=""),
+    ):
+        # Substring trap: "xa.bin ..." must NOT satisfy "a.bin".
+        (store / ".gitattributes").write_text(
+            "xa.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8"
+        )
+        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
+        text = (store / ".gitattributes").read_text(encoding="utf-8")
+        assert "a.bin filter=lfs" in text
+        assert text.count("a.bin filter=lfs") >= 1
+        # Exact entry for a.bin present exactly once; *.bin once.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        assert lines.count("a.bin filter=lfs diff=lfs merge=lfs -text") == 1
+        assert lines.count("*.bin filter=lfs diff=lfs merge=lfs -text") == 1
+        # Second call: idempotent, no duplicates.
+        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
+        text2 = (store / ".gitattributes").read_text(encoding="utf-8")
+        assert text2 == text
+
+
+def test_auto_add_glob_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    runner = CliRunner()
+    _make_config(runner, tmp_path, "snip", "git@example:x.git")
+    f = tmp_path / "note.txt"
+    f.write_text("hello\n")
+    r = runner.invoke(
+        cli,
+        ["-C", "snip", "target", "add", str(f), "--auto-add-glob", "*.txt"],
+    )
+    assert r.exit_code == 0, r.output
+    c = cfg.load("snip")
+    assert c.targets[0].auto_add_glob == "*.txt"
+    # Save/load round-trip (TOML) keeps the field.
+    cfg.save(c)
+    c2 = cfg.load("snip")
+    assert c2.targets[0].auto_add_glob == "*.txt"
+    # interest=diff is accepted and v1 deploys state (preview only).
+    assert c2.targets[0].interest in ("state", "diff")

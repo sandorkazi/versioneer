@@ -239,16 +239,85 @@ def artifact_rel(store_path: str, abs_path: Path, flex: str, root: str = "") -> 
     return Path(s) if s else Path("_root")
 
 
+def is_wine_prefix(abs_path: Path) -> bool:
+    """True when a path looks like (or lives inside) a wine prefix."""
+    try:
+        probe = abs_path if abs_path.is_dir() else abs_path.parent
+        if probe.is_dir():
+            try:
+                names = {p.name for p in probe.iterdir()}
+            except OSError:
+                names = set()
+            if "drive_c" in names:
+                return True
+        low = abs_path.as_posix().lower()
+        return "wine" in low or "pfx" in low
+    except OSError:
+        return False
+
+
 def wine_preset_ignores(abs_path: Path, ignore: list[str]) -> list[str]:
     out = list(ignore)
-    probe = abs_path if abs_path.is_dir() else abs_path.parent
-    looks_wine = ("drive_c" in {p.name for p in probe.iterdir()} if probe.is_dir() else False) \
-        or "wine" in abs_path.as_posix().lower() or "pfx" in abs_path.as_posix().lower()
-    if looks_wine:
+    if is_wine_prefix(abs_path):
         for pat in WINE_DEFAULT_IGNORES:
             if pat not in out:
                 out.append(pat)
     return out
+
+
+def compare_dir_trees(live_top: Path, stored_top: Path, ignore: list[str] | None = None,
+                      follow: bool = False) -> dict:
+    """Per-file compare of a dir target (live vs store snapshot).
+
+    Returns {"changed": [...], "untracked": [...], "missing": [...]} as
+    sorted rel-posix lists. Read errors count as changed (best-effort).
+    """
+    ignore = list(ignore or [])
+    try:
+        top_live = live_top.resolve(strict=False) if follow else live_top
+    except OSError:
+        top_live = live_top
+    live_files = iter_dir_files(top_live, ignore) if top_live.is_dir() else []
+    stored_files = iter_dir_files(stored_top, []) if stored_top.is_dir() else []
+    live_map: dict[str, Path] = {}
+    for f in live_files:
+        try:
+            rel = f.relative_to(top_live).as_posix()
+        except ValueError:
+            rel = f.name
+        live_map[rel] = f
+    stored_map: dict[str, Path] = {}
+    for f in stored_files:
+        try:
+            rel = f.relative_to(stored_top).as_posix()
+        except ValueError:
+            rel = f.name
+        stored_map[rel] = f
+    live_set = set(live_map)
+    stored_set = set(stored_map)
+    untracked = sorted(live_set - stored_set)
+    missing = sorted(stored_set - live_set)
+    changed: list[str] = []
+    for rel in sorted(live_set & stored_set):
+        lf, sf = live_map[rel], stored_map[rel]
+        try:
+            if lf.is_symlink() or sf.is_symlink():
+                llink = os.readlink(lf) if lf.is_symlink() else None
+                slink = os.readlink(sf) if sf.is_symlink() else None
+                if llink != slink:
+                    changed.append(rel)
+                elif llink is None:
+                    # one side link, other file -> changed
+                    changed.append(rel)
+                continue
+            if lf.stat().st_size != sf.stat().st_size:
+                changed.append(rel)
+                continue
+            if sha256_file(lf) != sha256_file(sf):
+                changed.append(rel)
+        except OSError:
+            changed.append(rel)
+    return {"changed": changed, "untracked": untracked, "missing": missing}
 
 
 # ---------- Phase 2: drift scan (backs `status`, daemon reuses) ----------

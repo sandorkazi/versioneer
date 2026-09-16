@@ -10,15 +10,29 @@ and redeploys them safely (backup → atomic write → permission restore → va
 It is **not** a blind backup tool (like `rsync`/`restic`) and **not** a dotfile templater
 (like `chezmoi`/`stow`) — it sits in between: versioned state + safe rollout + background monitoring.
 
-> **Project status: v1 implemented (Phases 0–9).**
-> `versioneer --help`, `config create/list/show/remove`, `target add/list/remove`,
-> `status/diff/log`, `commit/push/pull`, `deploy` (dry-run, plan, rollout,
-> backup, atomic write, perm restore), `service install/enable/disable/check`,
-> `bootstrap`, `watch`, `manifest`, `doctor` all work from source
-> (`pip install -e .`).
-> Prerequisites for v1 will be: Arch/CachyOS (or any systemd Linux),
+> **Project status: v1 implemented.**
+> `versioneer --help`, `config create/list/show/remove`, `target add/list/remove`
+> (incl. `--force` wine escape hatch, `--encrypt` warn-only, `--auto-add-glob`),
+> `status/diff/log` (incl. `status --host`), `commit` (incl. `--prune-retention`)
+> /`push`/`pull`, `deploy` (dry-run, `--plan-out`/`--plan`, backup, atomic write,
+> perm restore, `--prune`, `--host`/`--force-host`, `--to`, `--yes`/`--no-interaction`,
+> `--apply` for packages/systemd/wine), `service install/enable/disable/check/run`
+> (timers + `service run --once`), `uninstall` (`--purge-stores`/`--yes`/`--venv`),
+> `bootstrap <url> [--to DIR] [--host HOST] [--dry-run] [--yes]` and
+> `bootstrap --all` (store-side `.versioneer.toml` snapshot restore),
+> `watch [--auto-add] [--timeout N] [--glob PAT] [--ignore PAT] [--root DIR]`
+> (`inotify` via optional `watchdog`, polling fallback), `manifest
+> [--packages] [--wine] [--systemd] [--env]` (`[targets.manifest]` subtable),
+> `doctor [--secrets]` all work from source (`pip install -e .` or
+> `./installer/install.sh --dev`).
+> Secret scan + `encrypt=true` are warn-only in v1 (plaintext kept when
+> `sops`/`age` absent, never blocks). Retention is warn-by-default with opt-in
+> `--prune-retention` / `commit --prune-retention` (history kept, never squashes,
+> so `plan.json` hashes stay valid).
+> Prerequisites: Arch/CachyOS (or any systemd Linux),
 > Python 3.12+, `git`, `git-lfs`, a private git host with SSH auth,
-> `notify-send`/D-Bus for notifications (fallback: stdout/journal), optional `sops`+`age`.
+> `notify-send`/D-Bus for notifications (fallback: stdout/journal), optional `sops`+`age`,
+> optional `watchdog` for `inotify` immediacy.
 > See [§4](#4-installation) for the full checklist.
 
 ---
@@ -181,8 +195,9 @@ Rules (authoritative, from `implementation_plan.md §0`):
 
 ## 4. Installation
 
-> `installer/install.sh` is venv-only — it never uses system python for packages.
-> Completions stubs live in `installer/completions/` (bash/fish/zsh).
+> `installer/install.sh` is venv-only — it never uses system python for packages
+> (`VERSIONEER_VENV_DIR` overrides the default `~/.local/share/versioneer/venv`).
+> Full completions live in `installer/completions/` (bash/fish/zsh).
 > Rule: never `sudo pip install` / never `pip install --break-system-packages`.
 > Use the installer (creates `~/.local/share/versioneer/venv`) or `pipx`.
 
@@ -191,11 +206,12 @@ Arch / CachyOS (recommended):
 ```bash
 sudo pacman -S git git-lfs python-pipx
 git lfs install
-# optional hardening:
+# optional hardening + immediacy:
 sudo pacman -S sops age
+pip install 'versioneer[inotify]'   # optional watchdog for check_interval="inotify"
 
-# recommended: venv installer (Phase 0 works)
-./installer/install.sh --dev
+# recommended: venv installer
+./installer/install.sh --dev [--venv DIR] [--no-completions]
 source ~/.local/share/versioneer/venv/bin/activate
 versioneer --help
 
@@ -203,13 +219,24 @@ versioneer --help
 pipx install -e .
 ```
 
-What the installer does:
+What the installer does (see `installer/install.sh --help`):
 
-- installs `versioneer` CLI (via `pipx`/`uv` or system package),
-- installs `versioneer-user.service` + `versioneer-system.service` units,
-- installs shell completions (bash/fish/zsh — CLI is shell-agnostic),
-- checks `git lfs install`, prompts for upstream when you run `config create`,
-- `versioneer doctor` re-validates everything.
+- creates/uses a venv only (`~/.local/share/versioneer/venv` by default,
+  `VERSIONEER_VENV_DIR` or `--venv DIR` to override) and installs versioneer
+  into it (`-e` with `--dev`, regular install otherwise) — never `pipx`/`uv`
+  shims, never a system package, never system-python site installs;
+- preflight (fail or warn-only): requires `python3` ≥ 3.12 and `git`;
+  warns (never blocks) when `git-lfs` is missing;
+- installs shell completions (bash/fish/zsh — CLI is shell-agnostic) unless
+  `--no-completions`;
+- does **not** prompt for upstreams — upstreams are set per config at
+  `versioneer config create --upstream <url>`;
+- does **not** install systemd units — that is `versioneer service install`
+  (writes `versioneer-user.service` + `versioneer-user.timer` for
+  `service run --once`, stages system units for manual `sudo cp`;
+  see [§8](#8-monitor-engine--systemd-service));
+- `versioneer doctor` re-validates everything
+  (LFS, upstream reachability, disk, units, completions, `sops`/`age`).
 
 Requirements: Python 3.12+, `git`, `git-lfs`, `systemd`, `notify-send`/D-Bus (fallback: stdout/journal).
 
@@ -217,8 +244,8 @@ Requirements: Python 3.12+, `git`, `git-lfs`, `systemd`, `notify-send`/D-Bus (fa
 
 ## 5. Quickstart (5 minutes)
 
-> Phase 0: step 1 (`config create`) works from source. Steps 2–5 are
-> implemented: `target/status/commit/deploy` round-trip works, including
+> All 5 steps work end to end: `config create` → `target add` → `status`/`diff` →
+> `commit`/`push` → `bootstrap`/`deploy` round-trip, including
 > `.bak` backups, deploy-status files, and plan hash-guards.
 > Each step shows the expected output so you can tell success from failure.
 
@@ -314,33 +341,63 @@ versioneer -C hypr target remove ~/.config/hypr/old.conf
 `encrypt=true` or `ignore`) and **hardcoded-path lint** (absolute `/home/<other>/`
 inside a `text` file → suggest `--template`).
 
+Full `target add` flags: `--root DIR`, `--kind text|binary|dir|auto`
+(`manifest` is added via `manifest`, not `target add`), `--flex fixed|user|flexi|auto`,
+`--interest state|diff`, `--glob PATTERN`, `--auto-add-glob PATTERN`,
+`--ignore PATTERN` (repeatable), `--symlink preserve|follow`,
+`--machines h1,h2`, `--retention COUNT` (= `--retention-count`),
+`--retention-count N`, `--retention-age 30d`, `--template/--no-template`,
+`--on-deploy CMD`, `--deploy-path PATH` (flexi), `--check-interval 5m|inotify`,
+`--encrypt/--no-encrypt` (warn-only when `sops`/`age` absent, never blocks),
+`--force` (required escape hatch for whole wine-prefix dirs; manifest-only is default).
+
 ### Review (read-only) & save (explicit)
 
 ```bash
-versioneer -C hypr status            # modified|perm-drift|missing|untracked|read-error|clean
+versioneer -C hypr status [--host HOST]  # modified|perm-drift|missing|untracked|read-error|clean
 versioneer -C hypr diff              # unified diff (text), stat summary (binary/dir), recipe preview (manifest)
 versioneer -C hypr diff <target>
-versioneer -C hypr log               # git log for the store
+versioneer -C hypr log [-n 10]       # git log for the store
 versioneer -C hypr log <target>
 
 versioneer -C hypr commit -m "msg" <target>...
 versioneer -C savegames commit --all -m "post-session"   # bulk savegame style
+versioneer -C hypr commit --all --prune-retention  # opt-in local `git lfs prune` when retention exceeds
 versioneer -C hypr push
 versioneer -C hypr pull              # offline-safe: status/commit work offline, push/pull defer with message
 ```
 
 Locked savegames (SQLite WAL, game still running) are copied-then-hashed with a warning,
-never hashed in place.
+never hashed in place. Retention (`retention = {count, age}`, default `count=3`
+for `binary`) warns on `commit` by default; `--prune-retention` opts into a local
+`git lfs prune` (history kept, never squashes, so `plan.json` hashes stay valid).
 
 ### Service
 
 ```bash
-versioneer service install
-versioneer service enable
-versioneer service disable
+versioneer service install [--enable/--no-enable]  # writes user service+timer, stages system units
+versioneer service enable    # systemctl --user enable --now versioneer-user.timer
+versioneer service disable   # systemctl --user disable --now timer+service
+versioneer service check [-C <name>|--all] [--host HOST]  # one monitor pass (read-only by default)
+versioneer service run [--once] [--host HOST]  # daemon loop; systemd ExecStart uses --once
 # inspect with systemd directly:
-# systemctl --user status versioneer-user.service
-# sudo systemctl status versioneer-system.service
+# systemctl --user status versioneer-user.timer versioneer-user.service
+# sudo systemctl status versioneer-system.timer versioneer-system.service
+```
+
+Timers fire `service run --once` (user + system). `check_interval="inotify"`
+is immediate mode via the optional `watchdog` dependency with a tight-poll
+fallback. Daemon writes are zero by default; `auto_commit=true` (per config)
+allows silent commits, `auto_push=true` additionally pushes.
+
+### Uninstall
+
+```bash
+versioneer uninstall [--purge-stores] [--yes] [--venv DIR]
+./installer/uninstall.sh [--purge-stores] [--venv DIR]
+# stops/disables units, removes venv + completions + (after confirm) ~/.config/versioneer
+# stores in ~/versioneer-store/<name> are kept unless --purge-stores
+# full semantics in §16
 ```
 
 ### Deploy (selective, safe; full semantics in §7)
@@ -350,22 +407,41 @@ versioneer -C hypr deploy --dry-run
 versioneer -C hypr deploy --plan-out plan.json
 versioneer -C hypr deploy --plan plan.json [<target>...]
 versioneer -C hypr deploy [<target>...] [--to <path>] [--yes|--no-interaction]
-  [--force-host] [--prune] [--apply]
+  [--force-host] [--host HOST] [--prune] [--apply]
 # --to: required for flexi targets, preview path for fixed/user
 # --force-host: override machines allowlist (testing only)
+# --host: simulate a different hostname for the machines filter
 # --prune: allow dir merge to delete extras (default: never deletes)
-# --apply: allow manifest replay to write (packages); default prints only
+# --apply: manifest opt-in — packages runs `sudo pacman -S --needed`,
+#   systemd runs `systemctl enable`, wine writes setup-wine.sh
+#   (winetricks never auto-runs), env/unknown stay print-only.
+#   Default (no --apply) prints the replay only. Dry-run never applies.
+```
+
+### Watch (change capture → target add; full flow in §9)
+
+```bash
+versioneer -C savegames watch <dir> [--auto-add] [--timeout N]
+  [--root DIR] [--glob PATTERN] [--ignore PATTERN]
+# --auto-add: skip the interactive multi-select, track everything changed
+# --timeout N: stop after N seconds (tests/CI; also VERSIONEER_WATCH_TIMEOUT)
+# --root: added targets stored relative to DIR (defaults to config root)
+# --glob: glob string stored on the added targets
+# --ignore: repeatable ignore pattern; watchdog/inotify when installed, polling fallback
 ```
 
 ### Bootstrap (new machine)
 
 ```bash
 # single config from URL (--to overrides default store path):
-versioneer bootstrap <upstream-git-url> [--to DIR] [--host HOST]
+versioneer bootstrap <upstream-git-url> [--to DIR] [--host HOST] [--dry-run] [--yes]
 # all configs already declared in ~/.config/versioneer/:
 versioneer bootstrap --all [--host HOST]
-# = clone store(s) + recreate TOML(s) + deploy --all
-# recommended: deploy --dry-run first
+# = clone store(s) + recreate TOML(s) from the store-side .versioneer.toml
+#   snapshot (best-effort adopt when snapshot-less) + deploy
+# --dry-run: preview only (clone + deploy --dry-run, no writes, no status file)
+# --yes: assume yes for deploy overwrites
+# recommended: bootstrap --dry-run (or deploy --dry-run) first
 ```
 
 ### Manifests & doctor
@@ -620,22 +696,30 @@ path = "hyprland.conf"           # relative to root if root set, else absolute
 # hash = "sha256:..."            # baseline; drift = status, save = commit
 kind = "text"                    # text|binary|dir|manifest
 glob = ""                        # e.g. "~/.local/bin/*"
+auto_add_glob = ""               # e.g. "*.txt" — untracked matches for watch --auto-add
 ignore = []                      # e.g. ["*.log", "Cache/"]
 symlink = "preserve"             # preserve|follow
 flex = "user"                    # fixed|user|flexi
 interest = "state"               # state|diff (v1: diff previews diff, deploys state)
 deploy_path = ""                 # required for flexi (--to at deploy)
 machines = []                    # [] = all hosts, else ["laptop"]
-check_interval = ""              # per-target override, else meta value
-retention = { count = 3 }        # e.g. {count=30, age="30d"} for saves
+check_interval = ""              # per-target override ("5m", "inotify"), else meta value
+retention = { count = 3 }        # e.g. {count=30, age="30d"} for saves; warn-only + opt-in prune
 template = false                 # {{HOME}}/{{HOST}} substitution on deploy
 on_deploy = ""                   # e.g. "hyprctl reload"
+encrypt = false                  # sops/age per-target encryption; warn-only when sops absent
 
-[targets.manifest]               # only when kind="manifest"
+[targets.manifest]               # only when kind="manifest" (written by `manifest`, not `target add`)
 type = "wine"                    # packages|wine|systemd|env
 source = "builtin:wine"
 output = "wine-manifest.json"
 ```
+
+`encrypt` falls back to `meta.encrypt` when unset per target; both are warn-only
+in v1 (plaintext kept + `doctor`/lint warning when `sops`/`age` absent, never blocks).
+Empty `manifest` subtables are omitted on save (subtable only for `kind="manifest"`).
+Every `target add`/`commit`/`manifest` also exports a store-side snapshot
+(`<store>/.versioneer.toml`) so `bootstrap <url>` recreates exact TOMLs on a new machine.
 
 ---
 
@@ -652,8 +736,10 @@ output = "wine-manifest.json"
 
 - `text` → normal git objects, word diff.
 - `binary` → LFS (`*.bin` + explicit binary targets), `large_file_warn_mb` alert,
-  `retention = {count, age}` enforced on commit (Q3 decision: configurable, not silent squash).
+  `retention = {count, age}` warns on commit by default; opt-in
+  `commit --prune-retention` runs a local `git lfs prune` (history kept, never squashes).
 - `target remove` = `git rm` + commit; history kept (full purge via `git filter-repo` documented).
+- `<store>/.versioneer.toml` → store-side TOML snapshot (written on add/commit/manifest) for `bootstrap`.
 
 ---
 
@@ -662,9 +748,10 @@ output = "wine-manifest.json"
 ### Daemon debugging (when notifications don't arrive)
 
 ```bash
-systemctl --user status versioneer-user.service
+systemctl --user status versioneer-user.timer versioneer-user.service
 journalctl --user -u versioneer-user.service --since "2 hours ago"
-sudo systemctl status versioneer-system.service
+sudo systemctl status versioneer-system.timer versioneer-system.service
+versioneer -C hypr service check   # one monitor pass without systemd
 versioneer doctor -C hypr   # config-level health
 NOTIFY_DEBUG=1 versioneer -C hypr status  # stdout fallback when D-Bus missing
 ```
@@ -684,9 +771,11 @@ Uninstalled/broken service → `status` still works manually; only background ch
 | laptop vs desktop diverge | `machines=["laptop"]` + `{{HOST}}`, or per-machine branches (merge cost documented) |
 | `doctor` red | follow its list: `git-lfs`, upstream auth, disk, dangling symlinks, validators |
 | pushed a secret | rotate it now — git history keeps it; then enable `encrypt=true` (`sops/age`) |
-
-| `command not found: versioneer` | expected until Phase 0–1 lands; see status banner at top |
-| `installer/install.sh` missing | expected — not yet packaged; track Phase 6 |
+| `command not found: versioneer` | activate the venv (`source ~/.local/share/versioneer/venv/bin/activate`) or add it to `PATH`; reinstall via `./installer/install.sh --dev` |
+| `encrypt=true` but plaintext | expected when `sops`/`age` absent (warn-only in v1) — `sudo pacman -S sops age`, then `commit` again |
+| whole wine prefix tracked | manifest-only is default; `target add <prefix>` without `--force` refuses — use `manifest --wine` + selective `*.reg`, or re-run with `--force` |
+| manifest `deploy` only prints | expected — pass `--apply` (packages: `sudo pacman -S --needed`; systemd: `systemctl enable`; wine: writes `setup-wine.sh`; env: stays print-only) |
+| retention warnings on commit | expected past `retention = {count, age}` — history is kept; pass `commit --prune-retention` for a local `git lfs prune` |
 
 **Design choices worth knowing:** `diff`-interest deploys state in v1 (true patch-apply is v2);
 dir `merge` never deletes extras unless `--prune`; daemon never auto-pushes unless you opt in.
@@ -695,13 +784,15 @@ dir `merge` never deletes extras unless `--prune`; daemon never auto-pushes unle
 
 ## 16. Uninstall
 
-> Not yet implemented.
-
 ```bash
 versioneer service disable
-./installer/uninstall.sh   # or: versioneer uninstall
-# stops units, removes CLI + ~/.config/versioneer (after confirm)
+versioneer uninstall [--purge-stores] [--yes] [--venv DIR]
+# or: ./installer/uninstall.sh [--purge-stores] [--venv DIR]
+# stops/disables user+system timers/units, removes user unit files,
+# venv + completions + a ~/.local/bin/versioneer shim (when it points into the venv),
+# then ~/.config/versioneer TOMLs (after confirm, --yes to skip)
 # stores in ~/versioneer-store/<name> are kept unless --purge-stores is passed
+# (second confirm unless --yes)
 ```
 
 ---

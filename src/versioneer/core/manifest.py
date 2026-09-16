@@ -117,3 +117,217 @@ GENERATORS = {
     "systemd": gen_systemd,
     "env": gen_env,
 }
+
+
+# ---------- ITEM 6: safe --apply helpers ----------
+# Deploy stays print-only by default; --apply opts into the safe subset:
+# packages -> `sudo pacman -S --needed ...`, systemd -> `systemctl enable`,
+# env -> print-only always, wine -> generate setup-wine.sh, never auto-run
+# winetricks. All helpers are pure (no subprocess) so deploy.py owns the
+# only side effects and dry-run can guard them in one place.
+
+def manifest_kind_for_target(target) -> str:
+    """Infer manifest subtype (packages|wine|systemd|env) from a target.
+
+    Manifest targets are stored with path == artifact filename
+    (packages.list, wine-manifest.json, units.list, env.json). An explicit
+    `manifest_type`/`manifest` attribute wins when present; otherwise fall
+    back to filename heuristics so older TOMLs keep working.
+    """
+    for attr in ("manifest_type", "manifest", "manifest_kind"):
+        val = getattr(target, attr, "")
+        if isinstance(val, dict):
+            val = val.get("type", "")
+        if isinstance(val, str) and val.strip() in (
+            "packages", "wine", "systemd", "env",
+        ):
+            return val.strip()
+    path = str(getattr(target, "path", "") or "")
+    base = path.rsplit("/", 1)[-1].lower()
+    if base in ("packages.list", "setup-packages.sh"):
+        return "packages"
+    if base in ("wine-manifest.json", "setup-wine.sh"):
+        return "wine"
+    if base in ("units.list",):
+        return "systemd"
+    if base in ("env.json",):
+        return "env"
+    # loose fallback for renamed artifacts
+    if "package" in base:
+        return "packages"
+    if "wine" in base:
+        return "wine"
+    if "unit" in base or "systemd" in base:
+        return "systemd"
+    if base == "env" or "env." in base:
+        return "env"
+    return "unknown"
+
+
+def parse_packages_manifest(text: str) -> dict[str, list[str]]:
+    """Parse a packages.list artifact into {pacman, aur, flatpak} name lists."""
+    out: dict[str, list[str]] = {"pacman": [], "aur": [], "flatpak": []}
+    section: str | None = None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "---":
+            break  # replay setup snippet appended after --- is not data
+        if line.startswith("[") and line.endswith("]"):
+            head = line[1:-1].strip().lower()
+            if "pacman" in head:
+                section = "pacman"
+            elif "aur" in head:
+                section = "aur"
+            elif "flatpak" in head:
+                section = "flatpak"
+            else:
+                section = None
+            continue
+        if line.startswith(("#", "//")):
+            continue
+        if line.startswith(("setup-packages", "sudo pacman")):
+            continue
+        if line.startswith(("#!", "replay:")):
+            continue
+        if section in out:
+            # package names are single tokens; strip inline comments/version pins
+            token = line.split("#", 1)[0].strip().split()
+            if token:
+                out[section].append(token[0])
+        elif section is None:
+            # header-less legacy artifact: treat bare tokens as pacman names
+            if line and not line.startswith("("):
+                token = line.split()[0]
+                if token and "/" not in token and "=" not in token:
+                    pass  # keep strict: unknown section lines are ignored
+    # de-dup, preserve order
+    for key, values in out.items():
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for pkg in values:
+            if pkg not in seen:
+                seen.add(pkg)
+                uniq.append(pkg)
+        out[key] = uniq
+    return out
+
+
+def packages_apply_command(pacman_pkgs: list[str]) -> list[str]:
+    """Build the safe pacman replay/apply command (no --noconfirm)."""
+    return ["sudo", "pacman", "-S", "--needed", *pacman_pkgs]
+
+
+def replay_packages_text(parsed: dict[str, list[str]], limit: int = 20) -> str:
+    pkgs = list(parsed.get("pacman", []))
+    if not pkgs:
+        return "(no pacman packages recorded)"
+    shown = " ".join(pkgs[:limit])
+    extra = f" ... (+{len(pkgs) - limit} more)" if len(pkgs) > limit else ""
+    return f"sudo pacman -S --needed {shown}{extra}"
+
+
+def parse_systemd_manifest(text: str) -> dict[str, list[str]]:
+    """Parse a units.list artifact into {user, system} unit-name lists."""
+    user: list[str] = []
+    system: list[str] = []
+    current = "user"
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if "system units" in low and stripped.startswith("#"):
+            current = "system"
+            continue
+        if "user units" in low and stripped.startswith("#"):
+            current = "user"
+            continue
+        if stripped.startswith(("#", "(")):
+            continue
+        token = stripped.split()[0]
+        # keep plausible unit names only (foo.service, foo.timer, ...)
+        if "." in token and token[0].isalnum():
+            (user if current == "user" else system).append(token)
+    # de-dup, preserve order
+    for lst in (user, system):
+        seen: set[str] = set()
+        uniq = [u for u in lst if not (u in seen or seen.add(u))]  # type: ignore[func-returns-value]
+        lst[:] = uniq
+    return {"user": user, "system": system}
+
+
+def wine_setup_script_text(manifest_text: str) -> str:
+    """Render a setup-wine.sh recipe skeleton from wine-manifest.json text.
+
+    Never executed by versioneer itself (deploy --apply only writes the
+    file); winetricks verbs are listed for the user to run manually.
+    """
+    try:
+        data = json.loads(manifest_text or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    prefix = str(data.get("WINEPREFIX") or "~/.wine")
+    arch = str(data.get("WINEARCH") or "")
+    version = str(data.get("wine_version") or "")
+    verbs = data.get("winetricks_installed") or []
+    if not isinstance(verbs, list):
+        verbs = []
+    verbs = [str(v).strip() for v in verbs if str(v).strip()]
+    exes = data.get("exe_inventory") or []
+    if not isinstance(exes, list):
+        exes = []
+    lines = [
+        "#!/usr/bin/env bash",
+        "# versioneer wine recipe — REVIEW before running.",
+        "# Generated by `versioneer deploy --apply` from wine-manifest.json.",
+        "# versioneer never auto-runs winetricks; run the commands below manually.",
+        "set -u",
+        "",
+    ]
+    if version and version != "(wine not found)":
+        lines.append(f"# recorded wine version: {version}")
+    lines.append(f'export WINEPREFIX="{prefix}"')
+    if arch:
+        lines.append(f'export WINEARCH="{arch}"')
+    lines += [
+        "",
+        "# 1. create the prefix (manual):",
+        "#   winecfg",
+        "",
+        "# 2. install winetricks verbs recorded in the manifest (manual, one by one):",
+    ]
+    if verbs:
+        for v in verbs:
+            lines.append(f"#   winetricks {v}")
+    else:
+        lines.append("#   (no winetricks verbs recorded)")
+    lines += [
+        "",
+        "# 3. reinstall your programs into $WINEPREFIX (manual):",
+    ]
+    if exes:
+        for e in list(exes)[:20]:
+            lines.append(f"#   - {e}")
+        if len(exes) > 20:
+            lines.append(f"#   ... (+{len(exes) - 20} more, see wine-manifest.json)")
+    else:
+        lines.append("#   (no exe inventory recorded)")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def replay_wine_text(manifest_text: str) -> str:
+    try:
+        data = json.loads(manifest_text or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    prefix = data.get("WINEPREFIX", "~/.wine") if isinstance(data, dict) else "~/.wine"
+    verbs = data.get("winetricks_installed", []) if isinstance(data, dict) else []
+    n = len(verbs) if isinstance(verbs, list) else 0
+    version = data.get("wine_version", "") if isinstance(data, dict) else ""
+    return (f"setup-wine.sh: WINEPREFIX={prefix} wine {version}; "
+            f"winetricks verbs: {n} (manual, never auto-run)")

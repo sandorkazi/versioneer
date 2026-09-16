@@ -33,6 +33,15 @@ def is_readable(path: Path, follow: bool = True) -> bool:
         if path.is_symlink() and not follow:
             path.lstat()
             return True
+        # Mode-bits gate first: os.access returns True for root even on
+        # mode 000, so a file with no read bits must report unreadable
+        # (read-error) regardless of euid.
+        try:
+            st = path.stat() if follow else path.lstat()
+            if stat.S_IMODE(st.st_mode) & 0o444 == 0:
+                return False
+        except OSError:
+            return False
         return os.access(path, os.R_OK)
     except OSError:
         return False
