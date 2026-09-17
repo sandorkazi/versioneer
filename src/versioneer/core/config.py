@@ -24,8 +24,13 @@ def config_dir() -> Path:
     if override:
         return Path(override).expanduser()
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-    return base / "versioneer"
+    if xdg:
+        return Path(os.path.expandvars(xdg)).expanduser() / "versioneer"
+    # Sudo-aware: `sudo vers ...` must read the invoking user's configs,
+    # not /root/.config/versioneer.
+    from versioneer.core import elevate as _elev
+
+    return _elev.effective_home() / ".config" / "versioneer"
 
 
 def config_path(name: str) -> Path:
@@ -328,6 +333,12 @@ def export_snapshot(config: Config, store: Path) -> Path:
     path = snapshot_path(store)
     with path.open("wb") as f:
         tomli_w.dump(_payload_for(config), f)
+    try:
+        from versioneer.core import elevate as _elev
+
+        _elev.fix_store_after_write(store, [SNAPSHOT_NAME])
+    except (OSError, ImportError):
+        pass
     return path
 
 
@@ -359,6 +370,13 @@ def save(config: Config) -> Path:
     payload = _payload_for(config)
     with path.open("wb") as f:
         tomli_w.dump(payload, f)
+    try:
+        from versioneer.core import elevate as _elev
+
+        _elev.fix_ownership(d, recursive=False)
+        _elev.fix_ownership(path, recursive=False)
+    except (OSError, ImportError):
+        pass
     return path
 
 
@@ -373,7 +391,11 @@ def store_dir(config: Config) -> Path:
     import os as _os
 
     raw = config.meta.storage or f"~/versioneer-store/{config.meta.name}"
-    return Path(_os.path.expandvars(raw)).expanduser()
+    # Sudo-aware ~ expansion: bare ~/... follows the invoking user,
+    # not /root, so `sudo vers` uses the user's stores.
+    from versioneer.core import elevate as _elev
+
+    return _elev.expand_user(_os.path.expandvars(raw))
 
 
 def find_target(config: Config, key: str) -> Target | None:

@@ -25,14 +25,87 @@ console = Console()
     "--config",
     "config_name",
     default=None,
-    help="Config name to operate on (e.g. -C hypr).",
+    help="Config name to operate on (e.g. -C hypr). Omit to use 'default' (from init) or the sole config.",
 )
-@click.version_option(__version__, prog_name="versioneer")
+@click.version_option(__version__)
 @click.pass_context
 def cli(ctx: click.Context, config_name: str | None) -> None:
     """Service-based file and config monitoring for Linux."""
     ctx.ensure_object(dict)
     ctx.obj["config_name"] = config_name
+    # Transparent sudo: root-via-sudo reuses the invoking user's config/store
+    # (see elevate.effective_home) and store/config writes chown back to the
+    # user — but prefer a plain user run (sudo read is automatic).
+    try:
+        from versioneer.core import elevate as _elev_cli
+
+        _warn = _elev_cli.sudo_transparency_warning()
+    except ImportError:
+        _warn = None
+    if _warn:
+        console.print(f"[yellow]warn[/yellow]: {_warn}")
+
+
+# ---------- init (default config quickstart) ----------
+
+DEFAULT_CONFIG_NAME = "default"
+DEFAULT_STORE_PATH = "~/versioneer-store/default"
+
+
+def _create_config_files(meta, store_path: str):
+    """Shared create logic for `config create` and `init`."""
+    from versioneer.core import elevate as _elev
+    from versioneer.core import store as _store
+
+    name = meta.name
+    upstream = meta.upstream
+    errors = meta.validate()
+    if errors:
+        raise click.ClickException("; ".join(errors))
+    if cfg.config_path(name).exists():
+        raise click.ClickException(f"config {name!r} already exists: {cfg.config_path(name)}")
+
+    store = _elev.expand_user(os.path.expandvars(store_path))
+    try:
+        _store.ensure_repo(store)
+        _store.set_upstream(store, upstream)
+        # LFS install is warn-only: plain git keeps working without it.
+        lfs_warn = _store.ensure_lfs(store, ["*.bin"])
+        # initial commit so push/pull/log have a HEAD (offline-safe, no push here).
+        if not _store.log_lines(store, 1):
+            readme = store / ".versioneer-keep"
+            if not readme.exists():
+                readme.write_text(f"versioneer store for {name}\n", encoding="utf-8")
+            try:
+                _store.add_and_commit(store, [readme.name], f"init {name}")
+            except _store.GitError:
+                pass
+    except _store.GitError as e:
+        raise click.ClickException(str(e))
+
+    saved = cfg.save(cfg.Config(meta=meta))
+    return saved, store, lfs_warn
+
+
+@cli.command("init")
+@click.argument("upstream", required=False, default="")
+def init_cmd(upstream: str | None) -> None:
+    """Create default config + store (quickstart).
+
+    UPSTREAM is an optional upstream git URL (empty = local only).
+    Creates ~/.config/versioneer/default.toml + ~/versioneer-store/default/.
+    """
+    upstream = (upstream or "").strip()
+    meta = cfg.Meta(
+        name=DEFAULT_CONFIG_NAME,
+        upstream=upstream,
+        storage=DEFAULT_STORE_PATH,
+    )
+    saved, store, lfs_warn = _create_config_files(meta, DEFAULT_STORE_PATH)
+    msg = f"[green]created[/green] {saved} + store {store}"
+    if lfs_warn:
+        console.print(f"[yellow]warn[/yellow]: {lfs_warn}")
+    console.print(msg)
 
 
 # ---------- config management (implemented) ----------
@@ -53,8 +126,6 @@ def config_grp() -> None:
 @click.option("--notify/--no-notify", default=True, show_default=True)
 def config_create(name, store_path, upstream, auto_commit, auto_push, check_interval, notify):
     """Create a config: write TOML + git init store."""
-    from versioneer.core import store as _store
-
     meta = cfg.Meta(
         name=name,
         upstream=upstream,
@@ -64,31 +135,7 @@ def config_create(name, store_path, upstream, auto_commit, auto_push, check_inte
         auto_push=auto_push,
         check_interval=check_interval,
     )
-    errors = meta.validate()
-    if errors:
-        raise click.ClickException("; ".join(errors))
-    if cfg.config_path(name).exists():
-        raise click.ClickException(f"config {name!r} already exists: {cfg.config_path(name)}")
-
-    store = Path(os.path.expandvars(store_path)).expanduser()
-    try:
-        _store.ensure_repo(store)
-        _store.set_upstream(store, upstream)
-        # LFS install is warn-only: plain git keeps working without it.
-        lfs_warn = _store.ensure_lfs(store, ["*.bin"])
-        # initial commit so push/pull/log have a HEAD (offline-safe, no push here).
-        if not _store.log_lines(store, 1):
-            readme = store / ".versioneer-keep"
-            if not readme.exists():
-                readme.write_text(f"versioneer store for {name}\n", encoding="utf-8")
-            try:
-                _store.add_and_commit(store, [readme.name], f"init {name}")
-            except _store.GitError:
-                pass
-    except _store.GitError as e:
-        raise click.ClickException(str(e))
-
-    saved = cfg.save(cfg.Config(meta=meta))
+    saved, store, lfs_warn = _create_config_files(meta, store_path)
     msg = f"[green]created[/green] {saved} + store {store}"
     if lfs_warn:
         console.print(f"[yellow]warn[/yellow]: {lfs_warn}")
@@ -144,11 +191,22 @@ def _require_config(ctx: click.Context) -> str:
     # click group nesting: cli -> config -> show, so check grandparent too
     if name is None and ctx.parent and ctx.parent.parent:
         name = (ctx.parent.parent.params or {}).get("config_name")
-    if not name:
-        raise click.ClickException(
-            "missing -C/--config <name> (e.g. versioneer -C hypr config show)"
-        )
-    return name
+    if name:
+        return name
+    # No -C given: fall back to the `init` default, else the sole config.
+    try:
+        names = cfg.list_configs()
+    except OSError:
+        names = []
+    if DEFAULT_CONFIG_NAME in names:
+        return DEFAULT_CONFIG_NAME
+    if len(names) == 1:
+        return names[0]
+    hint = f" (available: {', '.join(names)})" if names else ""
+    raise click.ClickException(
+        f"missing -C/--config <name> (e.g. versioneer -C hypr config show){hint} "
+        f"— omit -C only when '{DEFAULT_CONFIG_NAME}' exists or a single config exists"
+    )
 
 
 def _select_targets(config, key: str | None) -> list:
@@ -201,7 +259,8 @@ def _stage_artifact(abs_path: Path, kind: str, symlink: str, ignore: list[str], 
             ignore=lambda d, names, _top=src_top, _ig=tuple(ignore): [
                 n
                 for n in names
-                if _mon.matches_ignore(
+                if n == ".git"
+                or _mon.matches_ignore(
                     ((Path(d).relative_to(_top).as_posix() + "/" + n) if Path(d) != _top else n),
                     list(_ig),
                 )
@@ -317,6 +376,7 @@ def target_add(
     """Start tracking PATH from now (baseline + commit, no backfill)."""
     import shutil as _shutil
 
+    from versioneer.core import elevate as _elev
     from versioneer.core import lint as _lint
     from versioneer.core import monitor as _mon
     from versioneer.core import permissions as _perm
@@ -390,9 +450,43 @@ def target_add(
         if flex == "user" and effective_root:
             raise click.ClickException("root must not be set for user targets (flex=user)")
 
-        # stat / symlink state
-        dangling = abs_path.is_symlink() and not abs_path.exists()
-        missing = not abs_path.exists() and not abs_path.is_symlink()
+        # stat / symlink state.
+        # NOTE: Path.exists() returns False for BOTH missing and
+        # permission-denied paths, which misled users into thinking a
+        # root-owned file "does not exist". Use lstat classification so
+        # EACCES/EPERM reports elevation instead of a bogus missing error.
+        # Sudo note: `sudo vers` fails ( ~/.local/bin not in secure_path ),
+        # so this command elevates only the *read* via `sudo cat/stat`
+        # and keeps TOML + store owned by the user.
+        try:
+            is_link = abs_path.is_symlink()
+        except OSError:
+            is_link = False
+        if is_link:
+            try:
+                dangling = not abs_path.exists()
+            except OSError:
+                dangling = True
+            missing = False
+        else:
+            dangling = False
+            state = _elev.classify_path(abs_path)
+            if state == "missing":
+                hint = ""
+                try:
+                    similar = _elev.suggest_similar(abs_path)
+                    if similar:
+                        hint = f" (did you mean: {', '.join(str(abs_path.parent / s) for s in similar)}?)"
+                except (OSError, ValueError):
+                    pass
+                raise click.ClickException(f"path does not exist: {abs_path}{hint}")
+            if state == "denied" and _elev.sudo_cmd() is None:
+                raise click.ClickException(
+                    f"cannot read {abs_path}: permission denied (sudo not found)"
+                )
+            # else: fall through — capture/hash/stage below retry via sudo
+            # (password prompt once; TOML + store stay owned by you).
+            missing = False
         if missing:
             raise click.ClickException(f"path does not exist: {abs_path}")
         if dangling and symlink == "follow":
@@ -422,18 +516,73 @@ def target_add(
 
         eff_ignore = _mon.wine_preset_ignores(abs_path, ignore_list)
         follow = symlink == "follow"
+        elevated = False
         try:
             owner, group, mode = _perm.capture(abs_path, follow=follow)
-        except OSError as e:
-            raise click.ClickException(f"cannot stat {abs_path}: {e}")
-        digest = _mon.hash_target(abs_path, kind, symlink, eff_ignore)
+        except OSError:
+            # Root-owned file: retry metadata via sudo stat (keeps TOML
+            # owned by the user; no `sudo vers` needed).
+            try:
+                owner, group, mode = _elev.stat_via_sudo(abs_path, follow=follow)
+                elevated = True
+                console.print(f"[yellow]warn[/yellow]: elevated read via sudo: {abs_path}")
+            except OSError as e2:
+                hint = ""
+                if _elev.sudo_cmd() is None:
+                    hint = " (sudo not found)"
+                else:
+                    hint = (
+                        " — if this is a root-owned file, ensure your user "
+                        "has sudo access (you will be prompted)"
+                    )
+                raise click.ClickException(f"cannot stat {abs_path}: {e2}{hint}")
+        try:
+            digest = _mon.hash_target(abs_path, kind, symlink, eff_ignore)
+        except OSError:
+            digest = "read-error"
+        if digest in ("missing", "read-error") and kind in ("text", "binary"):
+            # Retry content hash via `sudo cat` for root-owned files.
+            try:
+                digest = _elev.hash_file_elevated(abs_path, kind)
+                if not elevated:
+                    console.print(f"[yellow]warn[/yellow]: elevated read via sudo: {abs_path}")
+                elevated = True
+            except OSError as e:
+                if kind == "dir":
+                    raise click.ClickException(
+                        f"cannot read dir {abs_path}: {e} — run with a user "
+                        "that can read it (sudo access)"
+                    )
+                raise click.ClickException(
+                    f"cannot read {abs_path}: {e} — ensure sudo access "
+                    "(you will be prompted for your password)"
+                )
 
-        # warn-only lints
+        # warn-only lints (use elevated bytes when direct read was denied)
+        lint_data: bytes | None = None
+        if elevated and kind == "text" and not dangling:
+            try:
+                lint_data = _elev.read_bytes_via_sudo(abs_path)
+            except OSError:
+                lint_data = None
         if kind == "text" and not dangling and abs_path.is_file():
+            shown = False
             for w in _lint.scan_file(abs_path):
                 console.print(f"[yellow]warn[/yellow]: {w}")
+                shown = True
             for w in _lint.hardcoded_path_warnings(abs_path):
                 console.print(f"[yellow]warn[/yellow]: {w}")
+                shown = True
+            if not shown and lint_data is not None:
+                for w in _lint.scan_bytes(lint_data):
+                    console.print(f"[yellow]warn[/yellow]: {w}")
+                import re as _re
+
+                if _re.search(rb"/home/[^/\s:'\"]+", lint_data):
+                    console.print(
+                        "[yellow]warn[/yellow]: hardcoded path: /home/... found "
+                        "— consider --template (warn-only in v1)"
+                    )
         if kind == "binary" and abs_path.is_file():
             try:
                 size_mb = abs_path.stat().st_size / (1024 * 1024)
@@ -501,7 +650,8 @@ def target_add(
                     ignore=lambda d, names, _top=src_top, _ig=tuple(eff_ignore): [
                         n
                         for n in names
-                        if _mon.matches_ignore(
+                        if n == ".git"
+                        or _mon.matches_ignore(
                             (
                                 (Path(d).relative_to(_top).as_posix() + "/" + n)
                                 if Path(d) != _top
@@ -513,9 +663,62 @@ def target_add(
                 )
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                _shutil.copy2(abs_path, dest)
+                try:
+                    _shutil.copy2(abs_path, dest)
+                except OSError as e:
+                    import errno as _errno
+
+                    if e.errno in (_errno.EACCES, _errno.EPERM) and kind in (
+                        "text",
+                        "binary",
+                    ):
+                        # Root-owned file: stage via `sudo cat` so the store
+                        # copy stays owned by the user. No `sudo vers` needed
+                        # (~/.local/bin is not in sudo secure_path).
+                        try:
+                            data = _elev.read_bytes_via_sudo(abs_path)
+                        except OSError as e2:
+                            raise click.ClickException(
+                                f"cannot stage artifact for {abs_path}: {e2} — "
+                                "ensure sudo access (you will be prompted)"
+                            )
+                        try:
+                            dest.write_bytes(data)
+                        except OSError as e3:
+                            raise click.ClickException(
+                                f"cannot stage artifact for {abs_path}: {e3}"
+                            )
+                        try:
+                            _shutil.copystat(abs_path, dest, follow_symlinks=False)
+                        except OSError:
+                            pass  # perms come from TOML baseline
+                        if not elevated:
+                            console.print(
+                                f"[yellow]warn[/yellow]: elevated read via sudo: {abs_path}"
+                            )
+                    else:
+                        raise
         except OSError as e:
-            raise click.ClickException(f"cannot stage artifact for {abs_path}: {e}")
+            msg = f"cannot stage artifact for {abs_path}: {e}"
+            if "Permission denied" in str(e) or "Operation not permitted" in str(e):
+                if _elev.sudo_cmd() is None:
+                    msg += " (sudo not found)"
+                else:
+                    missing_shims = _elev.system_shim_missing()
+                    msg += (
+                        " — root-owned file? Just re-run the same command "
+                        "as your user (you will be prompted for your sudo "
+                        "password; no `sudo vers` needed)"
+                    )
+                    if missing_shims:
+                        msg += (
+                            f". Note: `sudo vers` fails (command not found) "
+                            f"because ~/.local/bin is not in sudo secure_path; "
+                            f"re-run ./installer/install.sh to create "
+                            f"{' and '.join(missing_shims)} for full-root runs "
+                            f"(shims are installed by default)"
+                        )
+            raise click.ClickException(msg)
 
         if kind == "binary":
             warn = _store.ensure_lfs(store, [rel.as_posix()])
@@ -559,7 +762,11 @@ def target_add(
         ga_warn = _store.ensure_lfs(store, rels)
         if ga_warn:
             console.print(f"[yellow]warn[/yellow]: {ga_warn}")
-        rels = rels + [".gitattributes"] if (store / ".gitattributes").exists() else rels
+    # .gitattributes is created by ensure_lfs at config create time (and by
+    # ensure_lfs above for binaries). Stage it whenever present so it never
+    # lingers as untracked dirt that pollutes future commits.
+    if (store / ".gitattributes").exists() and ".gitattributes" not in rels:
+        rels = rels + [".gitattributes"]
     if (store / cfg.SNAPSHOT_NAME).exists() and cfg.SNAPSHOT_NAME not in rels:
         rels = rels + [cfg.SNAPSHOT_NAME]
     try:
@@ -913,6 +1120,7 @@ def log(ctx, target, number):
 @click.pass_context
 def commit(ctx, message, all_targets, targets, prune_retention):
     """Save drift: re-hash + update TOML baselines + git commit (offline-safe)."""
+    from versioneer.core import elevate as _elev_c
     from versioneer.core import lint as _lint
     from versioneer.core import monitor as _mon
     from versioneer.core import permissions as _perm
@@ -963,11 +1171,34 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             skipped.append(f"{t.path} missing")
             continue
         if r["state"] == "read-error":
-            console.print(
-                f"[red]error[/red]: {t.path} read-error — {r['detail']} (run with elevation)"
-            )
-            skipped.append(f"{t.path} read-error")
-            continue
+            # Root-owned target scanned as user: scan_one is read-only and
+            # never prompts, so suggest the two supported elevation paths.
+            # (commit below retries the read via sudo when possible.)
+            detail = r["detail"]
+            if _elev_c.sudo_cmd() is not None:
+                # Retry the hash via sudo: a password prompt here is
+                # acceptable (interactive commit), unlike daemon scans.
+                try:
+                    _elev_c.hash_file_elevated(r["abs_path"], t.kind)
+                    console.print(
+                        f"[yellow]warn[/yellow]: {t.path}: elevated read via sudo "
+                        "(continuing commit)"
+                    )
+                except OSError:
+                    console.print(
+                        f"[red]error[/red]: {t.path} read-error — {detail} "
+                        "(root-owned file? ensure sudo access, or run status "
+                        "via the system unit / full-root CLI, see README §15)"
+                    )
+                    skipped.append(f"{t.path} read-error")
+                    continue
+            else:
+                console.print(
+                    f"[red]error[/red]: {t.path} read-error — {detail} "
+                    "(sudo not found; run with a user that can read it)"
+                )
+                skipped.append(f"{t.path} read-error")
+                continue
         abs_path = r["abs_path"]
         rel = r["rel"]
         dest = store / rel
@@ -998,9 +1229,26 @@ def commit(ctx, message, all_targets, targets, prune_retention):
         try:
             _stage_artifact(abs_path, t.kind, t.symlink, list(t.ignore or []), dest)
         except OSError as e:
-            console.print(f"[red]error[/red]: {t.path}: cannot stage artifact: {e}")
-            skipped.append(f"{t.path} stage-error")
-            continue
+            import errno as _errno_c
+
+            if (
+                e.errno in (_errno_c.EACCES, _errno_c.EPERM)
+                and t.kind in ("text", "binary")
+                and _elev_c.sudo_cmd() is not None
+            ):
+                try:
+                    data = _elev_c.read_bytes_via_sudo(abs_path)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(data)
+                    console.print(f"[yellow]warn[/yellow]: {t.path}: elevated read via sudo")
+                except OSError as e2:
+                    console.print(f"[red]error[/red]: {t.path}: cannot stage artifact: {e2}")
+                    skipped.append(f"{t.path} stage-error")
+                    continue
+            else:
+                console.print(f"[red]error[/red]: {t.path}: cannot stage artifact: {e}")
+                skipped.append(f"{t.path} stage-error")
+                continue
         if t.kind == "binary":
             warn = _store.ensure_lfs(store, [rel.as_posix()])
             if warn:
@@ -1012,16 +1260,29 @@ def commit(ctx, message, all_targets, targets, prune_retention):
 
             for w in _sec.encrypt_store_artifact(dest, t.kind):
                 console.print(f"[yellow]warn[/yellow]: {t.path}: {w}")
-        # refresh baseline from live state
+        # refresh baseline from live state (sudo retry for root-owned files)
         follow = t.symlink == "follow"
         try:
             owner, group, mode = _perm.capture(abs_path, follow=follow)
-        except OSError as e:
-            console.print(f"[red]error[/red]: {t.path}: cannot stat after stage: {e}")
-            skipped.append(f"{t.path} stat-error")
-            continue
+        except OSError:
+            try:
+                owner, group, mode = _elev_c.stat_via_sudo(abs_path, follow=follow)
+            except OSError as e:
+                console.print(f"[red]error[/red]: {t.path}: cannot stat after stage: {e}")
+                skipped.append(f"{t.path} stat-error")
+                continue
         t.owner, t.group, t.mode = owner, group, mode
-        t.hash = _mon.hash_target(abs_path, t.kind, t.symlink, list(t.ignore or []))
+        try:
+            t.hash = _mon.hash_target(abs_path, t.kind, t.symlink, list(t.ignore or []))
+        except OSError:
+            t.hash = "read-error"
+        if t.hash in ("missing", "read-error") and t.kind in ("text", "binary"):
+            try:
+                t.hash = _elev_c.hash_file_elevated(abs_path, t.kind)
+            except OSError as e:
+                console.print(f"[red]error[/red]: {t.path}: cannot hash after stage: {e}")
+                skipped.append(f"{t.path} hash-error")
+                continue
         rels.append(rel.as_posix())
         committed.append(t.path)
         # retention advisory (non-destructive, Q3 decision c: warn by default,
@@ -1058,8 +1319,8 @@ def commit(ctx, message, all_targets, targets, prune_retention):
         ga_warn = _store.ensure_lfs(store, rels)
         if ga_warn:
             console.print(f"[yellow]warn[/yellow]: {ga_warn}")
-        if (store / ".gitattributes").exists() and ".gitattributes" not in rels:
-            rels = rels + [".gitattributes"]
+    if (store / ".gitattributes").exists() and ".gitattributes" not in rels:
+        rels = rels + [".gitattributes"]
     try:
         cfg.save(config)
     except ValueError as e:
@@ -1351,6 +1612,22 @@ def service_install(do_enable):
         f"sudo cp {sys_staged.name} {sys_timer_staged.name} "
         "/etc/systemd/system/ && sudo systemctl daemon-reload"
     )
+    try:
+        from versioneer.core import elevate as _elev_svc
+
+        _missing_shims = _elev_svc.system_shim_missing()
+    except ImportError:
+        _missing_shims = []
+    if _missing_shims:
+        console.print(
+            "[yellow]warn[/yellow]: system unit ExecStart=/usr/local/bin/versioneer "
+            f"is missing ({', '.join(_missing_shims)}). "
+            "`sudo vers` will also fail (command not found: ~/.local/bin "
+            "is not in sudo secure_path). Fix: "
+            "re-run ./installer/install.sh (shims are installed by default). "
+            "Tracking root-owned files does NOT need `sudo vers`: "
+            "run `vers target add /etc/...` as your user (sudo read is automatic)."
+        )
 
     # 3. Write+enable timers: daemon-reload + enable --now (warn-only).
     console.print(
@@ -1515,7 +1792,9 @@ def _infer_targets_from_store(store_path: Path) -> list:
         if (Path("/" + rel_posix)).exists():
             flex, live = "fixed", Path("/" + rel_posix)
         else:
-            flex, live = "user", Path.home() / rel_posix
+            from versioneer.core import elevate as _elev_i
+
+            flex, live = "user", _elev_i.effective_home() / rel_posix
         kind, sym = "text", "preserve"
         if not is_link:
             try:
@@ -1638,10 +1917,11 @@ def bootstrap(upstream, all_configs, to_dir, host, dry_run, yes):
     assert upstream
     cname = _name_from_url(upstream)
     import os as _os
-    from pathlib import Path as _Path
+
+    from versioneer.core import elevate as _elev_b
 
     raw_store = to_dir or f"~/versioneer-store/{cname}"
-    store_path = _Path(_os.path.expandvars(raw_store)).expanduser()
+    store_path = _elev_b.expand_user(_os.path.expandvars(raw_store))
     if cfg.config_path(cname).exists():
         console.print(f"config {cname!r} already exists — pulling + deploying")
         try:
@@ -2191,35 +2471,68 @@ def doctor(ctx, secrets_only):
 
 
 def _uninstall_venv_dir(venv_opt: str | None) -> Path:
-    """Resolve the venv dir (CLI flag > env > default)."""
+    """Resolve the venv dir (CLI flag > env > default, sudo-aware)."""
     import os as _os
 
-    raw = venv_opt or _os.environ.get("VERSIONEER_VENV_DIR") or "~/.local/share/versioneer/venv"
-    return Path(_os.path.expandvars(raw)).expanduser()
+    from versioneer.core import elevate as _elev
+
+    raw = venv_opt or _os.environ.get("VERSIONEER_VENV_DIR")
+    if raw:
+        return _elev.expand_user(_os.path.expandvars(raw))
+    return _elev.effective_home() / ".local" / "share" / "versioneer" / "venv"
 
 
 def _uninstall_default_store_root() -> Path:
-    import os as _os
+    from versioneer.core import elevate as _elev
 
-    return Path(_os.path.expandvars("~/versioneer-store")).expanduser()
+    return _elev.effective_home() / "versioneer-store"
 
 
 def _uninstall_disable_units() -> list[str]:
     """Disable user+system timers/units (warn-only). Returns actions taken."""
+    import os as _os
     import shutil as _shutil
     import subprocess as _sp
 
     from versioneer.core import daemon as _daemon
+    from versioneer.core import elevate as _elev
 
     done: list[str] = []
     sys = _shutil.which("systemctl")
     if not sys:
         console.print("[yellow]warn[/yellow]: systemctl not found — skipping unit disable")
         return done
+    user_cmd = [
+        sys,
+        "--user",
+        "disable",
+        "--now",
+        _daemon.USER_TIMER_NAME,
+        _daemon.USER_SERVICE_NAME,
+    ]
+    # Under `sudo versioneer uninstall`, the --user manager must be the
+    # invoking user's, not root's.
+    inv = _elev.invoking_user()
+    if inv is not None:
+        sudo = _shutil.which("sudo")
+        if sudo:
+            user_cmd = [
+                sudo,
+                "-u",
+                inv,
+                sys,
+                "--user",
+                "disable",
+                "--now",
+                _daemon.USER_TIMER_NAME,
+                _daemon.USER_SERVICE_NAME,
+            ]
     cmds = [
-        [sys, "--user", "disable", "--now", _daemon.USER_TIMER_NAME, _daemon.USER_SERVICE_NAME],
+        user_cmd,
         [sys, "disable", "--now", _daemon.SYSTEM_TIMER_NAME, _daemon.SYSTEM_SERVICE_NAME],
     ]
+    # Silence unused-import lint for _os (kept for symmetry with shell scripts).
+    _ = _os.environ.get("USER", "")
     for cmd in cmds:
         try:
             _sp.run(cmd, check=False, capture_output=True, timeout=60)
@@ -2299,25 +2612,55 @@ def uninstall(purge_stores: bool, yes: bool, venv_opt: str | None) -> None:
     else:
         console.print(f"no venv at {venv_dir} (nothing to remove)")
 
-    # Remove a ~/.local/bin/versioneer shim only when it points into the venv.
+    # Remove ~/.local/bin/versioneer + vers shims only when they point into the venv.
     try:
-        import os as _os
+        from versioneer.core import elevate as _elev_u
 
-        shim = Path(_os.path.expandvars("$HOME")).expanduser() / ".local" / "bin" / "versioneer"
-        if shim.is_symlink():
+        _bindir = _elev_u.effective_home() / ".local" / "bin"
+        for _name in ("versioneer", "vers"):
+            shim = _bindir / _name
+            if shim.is_symlink():
+                try:
+                    target = shim.resolve(strict=False)
+                    if target.is_relative_to(venv_dir.resolve(strict=False)):
+                        shim.unlink()
+                        console.print(f"[yellow]removed[/yellow] shim {shim}")
+                except OSError as e:
+                    console.print(f"[yellow]warn[/yellow]: cannot remove shim {shim}: {e}")
+    except (OSError, ValueError):
+        pass
+
+    # Remove /usr/local/bin shims installed by the installer (best-effort;
+    # needs root, so warn instead of failing when sudo is unavailable).
+    try:
+        for _name in ("versioneer", "vers"):
+            _sys_shim = Path(f"/usr/local/bin/{_name}")
             try:
-                target = shim.resolve(strict=False)
-                if target.is_relative_to(venv_dir.resolve(strict=False)):
-                    shim.unlink()
-                    console.print(f"[yellow]removed[/yellow] shim {shim}")
-            except OSError as e:
-                console.print(f"[yellow]warn[/yellow]: cannot remove shim {shim}: {e}")
+                if _sys_shim.is_file() and not _sys_shim.is_symlink():
+                    try:
+                        _text = _sys_shim.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        _text = ""
+                    if "versioneer" in _text or venv_dir.as_posix() in _text:
+                        try:
+                            _sys_shim.unlink()
+                            console.print(f"[yellow]removed[/yellow] shim {_sys_shim}")
+                        except OSError:
+                            console.print(
+                                f"[yellow]warn[/yellow]: cannot remove {_sys_shim} "
+                                "(needs sudo: sudo rm "
+                                f"{_sys_shim})"
+                            )
+            except OSError:
+                pass
     except (OSError, ValueError):
         pass
 
     # 3. Remove shell completions (best-effort, mirrors uninstall.sh).
     try:
-        home = Path.home()
+        from versioneer.core import elevate as _elev_c
+
+        home = _elev_c.effective_home()
         for c in (
             home / ".local/share/bash-completion/completions/versioneer",
             home / ".config/fish/completions/versioneer.fish",

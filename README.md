@@ -210,10 +210,21 @@ git lfs install
 sudo pacman -S sops age
 pip install 'versioneer[inotify]'   # optional watchdog for check_interval="inotify"
 
-# recommended: venv installer
-./installer/install.sh --dev [--venv DIR] [--no-completions]
+# recommended: venv installer (run as YOUR user, not with sudo —
+# it only uses sudo once for the two /usr/local/bin shims)
+./installer/install.sh --dev [--venv DIR] [--no-completions] [--no-system-shim]
 source ~/.local/share/versioneer/venv/bin/activate
 versioneer --help
+# /usr/local/bin/versioneer + /usr/local/bin/vers shims are installed by
+# default (needs sudo once) so `sudo vers ...` works (sudo secure_path
+# excludes ~/.local/bin) and the system unit ExecStart resolves. Pass
+# --no-system-shim to skip them. Not needed for tracking root-owned
+# files: `vers target add /etc/...` elevates only the read via
+# `sudo cat/stat` automatically. If you do run the whole installer with
+# sudo (`sudo ./installer/install.sh`), the venv, completions and
+# ~/.local/bin links still target the invoking user (not /root).
+# `sudo vers ...` is sudo-aware: it reuses the invoking user's
+# configs/stores, not /root's.
 
 # alternative: pipx (own venv per app)
 pipx install -e .
@@ -761,7 +772,10 @@ Uninstalled/broken service → `status` still works manually; only background ch
 
 | Symptom | Fix |
 | ------- | --- |
-| `read-error` on `/etc/*` | run `sudo versioneer -C etc status`; system unit only reads, never writes |
+| `read-error` on `/etc/*` | system unit reads as root (never writes); for one-off checks run `sudo versioneer -C etc status` (needs the default installer shims; the CLI reuses your configs, `--preserve-env=HOME` also works) |
+| `sudo vers: command not found` | means the `/usr/local/bin` shims are missing — `~/.local/bin` is not in sudo `secure_path`. Fix: re-run `./installer/install.sh` (shims are installed by default, sudo is used once just for those two files; `--no-system-shim` skips them). Tracking root-owned files does NOT need `sudo vers`: just run `vers target add /etc/...` as your user (sudo read is automatic, password prompted once). Do not run the whole installer with sudo in the normal case (it works — files still target your user — but it is unnecessary). |
+| `target add /etc/...` says `permission denied` | ensure your user has sudo access — you will be prompted once; TOML + store stay owned by you. Dir targets still need direct read access |
+| `target add` says `path does not exist` for a root-owned path | it distinguishes missing (`ENOENT`) from denied (`EACCES`): denied paths now elevate via sudo instead of reporting missing. If truly missing, it suggests close names (e.g. `/etc/security/faillock` vs `faillock.conf`) |
 | daemon spams savegame notifs | set `check_interval="5m"` + `auto_commit=true`, add `ignore` for `Cache/*.log` |
 | binary > 10 MB warning | expected for saves/prefixes; confirm LFS, or split target / use manifest |
 | `flexi` deploy fails | pass `--to <path>` or set `deploy_path`; entry fails alone, run continues |

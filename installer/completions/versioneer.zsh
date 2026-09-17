@@ -1,8 +1,8 @@
-#compdef versioneer
-# zsh completion for versioneer (full flags/subcommands).
+#compdef versioneer vers
+# zsh completion for versioneer / vers (full flags/subcommands).
 # Enable: fpath+=(installer/completions); compinit
 _versioneer() {
-  local -a cmds=(config target status diff log commit push pull deploy service bootstrap watch manifest doctor uninstall)
+  local -a cmds=(init config target status diff log commit push pull deploy service bootstrap watch manifest doctor uninstall)
   local -a config_sub=(create list show remove)
   local -a target_sub=(add list remove)
   local -a service_sub=(install enable disable check run)
@@ -43,4 +43,4 @@ _versioneer() {
       esac ;;
   esac
 }
-compdef _versioneer versioneer
+compdef _versioneer versioneer vers

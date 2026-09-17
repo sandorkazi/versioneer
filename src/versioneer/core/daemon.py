@@ -316,7 +316,12 @@ SYSTEM_TIMER_NAME = "versioneer-system.timer"
 
 def completion_paths(home: Path | None = None) -> list[Path]:
     """User-level shell completion paths (mirrors installer/install.sh)."""
-    base = home or Path.home()
+    if home is None:
+        from versioneer.core import elevate as _elev
+
+        base = _elev.effective_home()
+    else:
+        base = home
     return [
         base / ".local/share/bash-completion/completions/versioneer",
         base / ".config/fish/completions/versioneer.fish",
@@ -447,11 +452,21 @@ def try_reload_and_enable() -> tuple[bool, str]:
 
 def user_unit_path() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    if xdg:
+        base = Path(os.path.expandvars(xdg)).expanduser()
+    else:
+        from versioneer.core import elevate as _elev
+
+        base = _elev.effective_home() / ".config"
     return base / "systemd" / "user" / USER_SERVICE_NAME
 
 
 def user_timer_path() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    if xdg:
+        base = Path(os.path.expandvars(xdg)).expanduser()
+    else:
+        from versioneer.core import elevate as _elev
+
+        base = _elev.effective_home() / ".config"
     return base / "systemd" / "user" / USER_TIMER_NAME
