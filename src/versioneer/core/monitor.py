@@ -269,26 +269,60 @@ def artifact_rel(store_path: str, abs_path: Path, flex: str, root: str = "") -> 
     return Path(s) if s else Path("_root")
 
 
+def _dir_is_prefix_root(d: Path) -> bool:
+    """True when directory listing itself looks like a wine prefix root."""
+    try:
+        if not d.is_dir():
+            return False
+        try:
+            names = {p.name for p in d.iterdir()}
+        except OSError:
+            return False
+        if "drive_c" in names:
+            return True
+        # Prefix without drive_c yet (rare): require both registry + dosdevices.
+        if "system.reg" in names and "dosdevices" in names:
+            return True
+        return False
+    except OSError:
+        return False
+
+
 def is_wine_prefix(abs_path: Path) -> bool:
-    """True when a path looks like (or lives inside) a wine prefix."""
+    """True only when the path itself is a wine prefix root (not a subdir).
+
+    Previous heuristic also matched any path containing the substring
+    "wine"/"pfx" plus any dir living inside a prefix, which falsely
+    refused savegame folders like <prefix>/drive_c/.../SavedGames/Slot1.
+    The full-prefix --force gate must only trigger on the root itself;
+    use is_inside_wine_prefix() for the broader preset-ignore case.
+    """
     try:
         probe = abs_path if abs_path.is_dir() else abs_path.parent
-        if probe.is_dir():
-            try:
-                names = {p.name for p in probe.iterdir()}
-            except OSError:
-                names = set()
-            if "drive_c" in names:
+        return _dir_is_prefix_root(probe)
+    except OSError:
+        return False
+
+
+def is_inside_wine_prefix(abs_path: Path, max_depth: int = 12) -> bool:
+    """True when path is a prefix root or lives under one (ancestor has drive_c)."""
+    try:
+        cur = abs_path if abs_path.is_dir() else abs_path.parent
+        for _ in range(max_depth):
+            if _dir_is_prefix_root(cur):
                 return True
-        low = abs_path.as_posix().lower()
-        return "wine" in low or "pfx" in low
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+        return False
     except OSError:
         return False
 
 
 def wine_preset_ignores(abs_path: Path, ignore: list[str]) -> list[str]:
     out = list(ignore)
-    if is_wine_prefix(abs_path):
+    if is_wine_prefix(abs_path) or is_inside_wine_prefix(abs_path):
         for pat in WINE_DEFAULT_IGNORES:
             if pat not in out:
                 out.append(pat)
