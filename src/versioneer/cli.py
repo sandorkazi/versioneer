@@ -113,7 +113,7 @@ def init_cmd(upstream: str | None) -> None:
 
 @cli.group("config")
 def config_grp() -> None:
-    """Create/list/show/remove configs."""
+    """Create/list/show/set-upstream/remove configs."""
 
 
 @config_grp.command("create")
@@ -181,6 +181,73 @@ def config_remove(ctx):
         raise click.ClickException(f"config {name!r} not found")
     path.unlink()
     console.print(f"[yellow]removed[/yellow] {path} (store repo kept)")
+
+
+@config_grp.command("set-upstream")
+@click.argument("url", required=False)
+@click.option("--remove", is_flag=True, default=False, help="Clear upstream (local-only).")
+@click.pass_context
+def config_set_upstream(ctx, url, remove):
+    """Set or clear the upstream git URL for a config.
+
+    Updates the TOML (meta.upstream) and the store's git origin, then
+    refreshes the store-side snapshot. Offline-safe (no network access).
+
+    \b
+    versioneer -C hypr config set-upstream git@github.com:me/new.git
+    versioneer -C hypr config set-upstream --remove
+    """
+    from versioneer.core import store as _store
+
+    name = _require_config(ctx)
+    try:
+        config = cfg.load(name)
+    except FileNotFoundError:
+        raise click.ClickException(f"config {name!r} not found in {cfg.config_dir()}")
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    if remove and url:
+        raise click.ClickException("pass either URL or --remove, not both")
+    if remove:
+        new_upstream = ""
+    else:
+        new_upstream = (url or "").strip()
+        if not new_upstream:
+            raise click.ClickException(
+                "usage: versioneer -C <name> config set-upstream <git-url> | --remove"
+            )
+    old_upstream = config.meta.upstream or ""
+    store = cfg.store_dir(config)
+    try:
+        _store.ensure_repo(store)
+        if new_upstream:
+            _store.set_upstream(store, new_upstream)
+        else:
+            _store.remove_upstream(store)
+    except _store.GitError as e:
+        raise click.ClickException(str(e))
+    config.meta.upstream = new_upstream
+    try:
+        saved = cfg.save(config)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    try:
+        cfg.export_snapshot(config, store)
+        try:
+            _store.add_and_commit(store, [cfg.SNAPSHOT_NAME], "set upstream")
+        except _store.GitError:
+            pass
+    except (ValueError, OSError) as e:
+        console.print(f"[yellow]warn[/yellow]: snapshot refresh skipped: {e}")
+    if not new_upstream:
+        console.print(f"[green]cleared[/green] upstream for {name} ({saved}, local-only)")
+    elif old_upstream == new_upstream:
+        console.print(f"upstream unchanged for {name}: {new_upstream or '(none)'}")
+    else:
+        console.print(
+            f"[green]updated[/green] upstream for {name}: "
+            f"{old_upstream or '(none)'} -> {new_upstream}"
+        )
 
 
 def _require_config(ctx: click.Context) -> str:

@@ -315,6 +315,8 @@ versioneer config create --name <short> --path <store-path> --upstream <git-url>
   [--auto-commit] [--auto-push] [--check-interval 5m] [--notify/--no-notify]
 versioneer config list
 versioneer config show -C hypr
+versioneer -C hypr config set-upstream <new-git-url>  # change/add upstream (TOML + git origin, offline-safe)
+versioneer -C hypr config set-upstream --remove       # go local-only (clears TOML + origin)
 versioneer config remove -C oldname
 ```
 

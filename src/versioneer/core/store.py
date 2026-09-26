@@ -298,6 +298,24 @@ def set_upstream(store: Path, url: str) -> None:
             pass
 
 
+def remove_upstream(store: Path) -> bool:
+    """Remove the origin remote (go local-only). Returns True when removed."""
+    if not is_repo(store):
+        return False
+    if not get_upstream(store):
+        return False
+    try:
+        _run_git(["remote", "remove", "origin"], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store)
+        except (OSError, ImportError):
+            pass
+    return True
+
+
 def _offline_wrap(action: str, err: GitError) -> GitError:
     msg = str(err).strip()
     low = msg.lower()
