@@ -109,12 +109,26 @@ def parse_interval(spec: str, default_s: int = 3 * 3600) -> int:
         return default_s
 
 
+def _target_wants_auto_commit(config, target) -> bool:
+    """Effective auto-commit for one target.
+
+    Legacy per-config ``meta.auto_commit`` opts every target in; otherwise
+    only targets with per-target ``auto_commit=true`` (which requires
+    limited ``retention.count``) are auto-committable.
+    """
+    if config.meta.auto_commit:
+        return True
+    return bool(getattr(target, "auto_commit", False))
+
+
 def check_once(config_name: str, host: str = "") -> dict:
     """Single read-only scan + optional auto_commit/auto_push branch.
 
     Returns {"config": name, "drift": [...], "notified": bool,
-             "committed": [...], "pushed": bool, "errors": [...]}.
-    Zero git writes unless config.meta.auto_commit is True.
+             "committed": [...], "pushed": bool, "errors": [...],
+             "warnings": [...] (space warnings when auto-commit fires)}.
+    Zero git writes unless config.meta.auto_commit or a drifted target has
+    per-target auto_commit=true (which requires limited retention).
     """
     host = host or socket.gethostname()
     config = _cfg.load(config_name)
@@ -130,19 +144,72 @@ def check_once(config_name: str, host: str = "") -> dict:
         "committed": [],
         "pushed": False,
         "errors": [],
+        "warnings": [],
     }
     if not drift:
         return out
-    if config.meta.auto_commit:
-        # opt-in silent commit path (savegames/snippets)
+    auto_results = [r for r in drift if _target_wants_auto_commit(config, r["target"])]
+    if auto_results:
+        # opt-in silent commit path (savegames/snippets):
+        # whole-config meta.auto_commit (legacy) or per-target auto_commit.
         from versioneer.core import permissions as _perm
 
+        # Per-target guard (error case): the store index may already be
+        # messed up (files staged but never committed explicitly). A silent
+        # `git commit` would sweep in every staged path, not just our
+        # auto-commit rels — so refuse when staged changes belong to
+        # non-autocommittable targets. Only staged changes matter
+        # (`git commit` commits the index; unstaged/untracked dirt is safe).
+        # Legacy whole-config auto_commit opts every target in, so the guard
+        # only applies to mixed per-target mode.
+        if not config.meta.auto_commit:
+            _valid_for_guard = [
+                r
+                for r in auto_results
+                if r["state"] not in ("missing", "read-error")
+                and _cfg.has_limited_retention(getattr(r["target"], "retention", {}))
+            ]
+            _auto_rels = {r["rel"].as_posix() for r in _valid_for_guard}
+            _internal = {_cfg.SNAPSHOT_NAME, ".gitattributes", ".versioneer-keep"}
+            _blocking: list[str] = []
+            for _s in _store.staged_files(store):
+                if _s in _internal:
+                    continue
+                if any(_s == _a or _s.startswith(_a.rstrip("/") + "/") for _a in _auto_rels):
+                    continue
+                _blocking.append(_s)
+            if _blocking:
+                for r in auto_results:
+                    t = r["target"]
+                    if r["state"] in ("missing", "read-error"):
+                        out["errors"].append(f"{t.path}: {r['state']} — {r['detail']}")
+                out["errors"].append(
+                    "auto-commit refused: non-autocommittable files have staged "
+                    f"changes: {', '.join(_blocking[:5])} — commit them explicitly "
+                    f"via `versioneer -C {config_name} commit` (store index already "
+                    "messed up, refusing to sweep them into a silent auto-commit)"
+                )
+                if config.meta.notify:
+                    _notify.send(
+                        f"versioneer {config_name}: auto-commit refused",
+                        "; ".join(out["errors"][:3]),
+                    )
+                    out["notified"] = True
+                return out
+
         rels: list[str] = []
-        for r in results:
+        for r in auto_results:
             t = r["target"]
-            if r["state"] in ("clean", "missing", "read-error"):
-                if r["state"] != "clean":
-                    out["errors"].append(f"{t.path}: {r['state']} — {r['detail']}")
+            if r["state"] in ("missing", "read-error"):
+                out["errors"].append(f"{t.path}: {r['state']} — {r['detail']}")
+                continue
+            if not config.meta.auto_commit and not _cfg.has_limited_retention(
+                getattr(t, "retention", {})
+            ):
+                out["errors"].append(
+                    f"{t.path}: auto-commit skipped — "
+                    "requires limited retention (set retention.count >= 1)"
+                )
                 continue
             abs_path = r["abs_path"]
             rel = r["rel"]
@@ -176,15 +243,31 @@ def check_once(config_name: str, host: str = "") -> dict:
                 out["errors"].append(f"auto-commit failed: {e}")
                 out["committed"] = []
                 return out
+            out["warnings"].append(
+                f"{_cfg.AUTO_COMMIT_SPACE_WARNING} "
+                f"(auto-committed {len(out['committed'])} target(s): "
+                f"{', '.join(out['committed'][:5])})"
+            )
             if config.meta.auto_push:
                 try:
                     _store.push(store)
                     out["pushed"] = True
                 except _store.GitError as e:
                     out["errors"].append(f"auto-push deferred: {e}")
+        # Non-auto drift still notifies (mixed configs); auto errors notify too.
+        remaining = [r for r in drift if r["target"].path not in out["committed"]]
         if out["errors"] and config.meta.notify:
             _notify.send(
                 f"versioneer {config_name}: auto-commit errors", "; ".join(out["errors"][:3])
+            )
+            out["notified"] = True
+        if remaining and config.meta.notify and not out["notified"]:
+            summary = ", ".join(
+                f"{r['target'].path} ({r['state']})" for r in remaining[:5]
+            )
+            _notify.send(
+                f"versioneer {config_name}: drift detected",
+                f"{len(remaining)} target(s): {summary} — run `versioneer -C {config_name} status`",
             )
             out["notified"] = True
         return out

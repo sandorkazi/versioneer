@@ -4,7 +4,7 @@
 _versioneer() {
   local -a cmds=(init config target status diff log commit push pull deploy service bootstrap watch manifest doctor uninstall)
   local -a config_sub=(create list show remove)
-  local -a target_sub=(add list remove)
+  local -a target_sub=(add list remove set)
   local -a service_sub=(install enable disable check run)
   _arguments -C \
     '-C[config name]:config:' '--config[config name]:config:' \
@@ -22,7 +22,8 @@ _versioneer() {
         target)
           _describe 'target subcommand' target_sub
           case ${words[3]} in
-            add) _arguments '--root[root]:' '--kind[kind]:(text binary dir auto)' '--flex[flex]:(fixed user flexi auto)' '--interest[interest]:(state diff)' '--glob[glob]:' '--auto-add-glob[glob]:' '--ignore[pattern]:' '--symlink[symlink]:(preserve follow)' '--machines[hosts]:' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--template' '--no-template' '--on-deploy[cmd]:' '--deploy-path[path]:' '--check-interval[interval]:' '--encrypt' '--no-encrypt' '--force' ;;
+            add) _arguments '--root[root]:' '--kind[kind]:(text binary dir auto)' '--flex[flex]:(fixed user flexi auto)' '--interest[interest]:(state diff)' '--glob[glob]:' '--auto-add-glob[glob]:' '--ignore[pattern]:' '--symlink[symlink]:(preserve follow)' '--machines[hosts]:' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--template' '--no-template' '--on-deploy[cmd]:' '--deploy-path[path]:' '--check-interval[interval]:' '--encrypt' '--no-encrypt' '--auto-commit' '--no-auto-commit' '--force' ;;
+            set) _arguments '--auto-commit' '--no-auto-commit' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--clear-retention' ;;
           esac ;;
         service)
           _describe 'service subcommand' service_sub

@@ -6,7 +6,7 @@ for prog in versioneer vers
   end
   # subcommands
   complete -c $prog -f -n '__fish_seen_subcommand_from config' -a "create list show remove"
-  complete -c $prog -f -n '__fish_seen_subcommand_from target' -a "add list remove"
+  complete -c $prog -f -n '__fish_seen_subcommand_from target' -a "add list remove set"
   complete -c $prog -f -n '__fish_seen_subcommand_from service' -a "install enable disable check run"
   # global
   complete -c $prog -s C -l config -d 'Config name' -r
@@ -20,8 +20,12 @@ for prog in versioneer vers
   complete -c $prog -f -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from create' -l notify
   complete -c $prog -f -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from create' -l no-notify
   # target add
-  for flag in root kind flex interest glob auto-add-glob ignore symlink machines retention retention-count retention-age template no-template on-deploy deploy-path check-interval encrypt no-encrypt force
+  for flag in root kind flex interest glob auto-add-glob ignore symlink machines retention retention-count retention-age template no-template on-deploy deploy-path check-interval encrypt no-encrypt auto-commit no-auto-commit force
     complete -c $prog -f -n '__fish_seen_subcommand_from target; and __fish_seen_subcommand_from add' -l $flag
+  end
+  # target set (toggle autocommittability / retention on tracked files)
+  for flag in auto-commit no-auto-commit retention retention-count retention-age clear-retention
+    complete -c $prog -f -n '__fish_seen_subcommand_from target; and __fish_seen_subcommand_from set' -l $flag
   end
   # service
   complete -c $prog -f -n '__fish_seen_subcommand_from service; and __fish_seen_subcommand_from install' -l enable

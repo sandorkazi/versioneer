@@ -11,8 +11,9 @@ It is **not** a blind backup tool (like `rsync`/`restic`) and **not** a dotfile 
 (like `chezmoi`/`stow`) — it sits in between: versioned state + safe rollout + background monitoring.
 
 > **Project status: v1 implemented.**
-> `versioneer --help`, `config create/list/show/remove`, `target add/list/remove`
-> (incl. `--force` wine escape hatch, `--encrypt` warn-only, `--auto-add-glob`),
+> `versioneer --help`, `config create/list/show/remove`, `target add/list/remove/set`
+> (incl. `--force` wine escape hatch, `--encrypt` warn-only, `--auto-add-glob`,
+> per-target `--auto-commit` with limited retention),
 > `status/diff/log` (incl. `status --host`), `commit` (incl. `--prune-retention`)
 > /`push`/`pull`, `deploy` (dry-run, `--plan-out`/`--plan`, backup, atomic write,
 > perm restore, `--prune`, `--host`/`--force-host`, `--to`, `--yes`/`--no-interaction`,
@@ -109,7 +110,10 @@ versioneer -C savegames commit --all -m "after boss fight"
 ```
 
 Each config has its own TOML, its own store repo, its own upstream, its own
-`notify` / `auto_commit` / `check_interval` policy. Typical split:
+`notify` / `auto_commit` / `check_interval` policy. `auto_commit` can also be
+set per target (`target add/set --auto-commit`, autocommittable files), which
+commits drift for that file only even when the config itself stays manual.
+Typical split:
 
 | Config       | Example targets                          | Notify | Auto-commit |
 | ------------ | ---------------------------------------- | ------ | ----------- |
@@ -130,6 +134,7 @@ Every target has three independent axes:
 | **interest**   | `state` `diff`                                      | do you care about whole file or what changed                   |
 
 Plus practical fields: `glob`, `ignore`, `symlink`, `machines`, `retention`,
+`auto_commit` (per-file auto-commit, requires limited `retention.count`),
 `template`, `on_deploy` (see [§13](#13-config-file-reference)).
 
 - **flex:**
@@ -184,6 +189,8 @@ Rules (authoritative, from `implementation_plan.md §0`):
    Working file untouched, git history kept.
 3. **Daemon is read-only by default.** `hash + stat` only, never `commit/push`.
    Exception: per-config `auto_commit=true` (savegames/snippets) allows silent commit;
+   per-target `auto_commit=true` (autocommittable files, requires limited
+   `retention.count`) allows silent commit of that file's drift only;
    `auto_push=true` (off by default) additionally pushes.
 4. **Save and rollout are always explicit and selective:**
    `commit [--all|<target>...]`, `push/pull`, `deploy [<target>...] [--dry-run]`.
@@ -348,6 +355,14 @@ versioneer -C savegames target add ~/.local/share/Steam/.../saves \
 # list / stop tracking (keeps file on disk + git history)
 versioneer -C hypr target list
 versioneer -C hypr target remove ~/.config/hypr/old.conf
+
+# per-file auto-commit (autocommittable files): daemon commits drift silently.
+# Only available with limited retention; enabling warns that frequent
+# commits could take up space quickly.
+versioneer -C savegames target add ~/saves/slot1.sav \
+  --auto-commit --retention-count 30 --retention-age 30d
+versioneer -C savegames target set ~/saves/slot1.sav --auto-commit --retention-count 30
+versioneer -C savegames target set ~/saves/slot1.sav --no-auto-commit
 ```
 
 `add` also runs two lints (warn-only): **secret scan** (possible token/key → suggest
@@ -362,7 +377,15 @@ Full `target add` flags: `--root DIR`, `--kind text|binary|dir|auto`
 `--retention-count N`, `--retention-age 30d`, `--template/--no-template`,
 `--on-deploy CMD`, `--deploy-path PATH` (flexi), `--check-interval 5m|inotify`,
 `--encrypt/--no-encrypt` (warn-only when `sops`/`age` absent, never blocks),
+`--auto-commit/--no-auto-commit` (per-target auto-commit; requires
+`--retention-count N`, warns that frequent commits could take up space quickly),
 `--force` (required escape hatch for whole wine-prefix dirs; manifest-only is default).
+
+`target set <path>` toggles autocommittability / retention on an already
+tracked file: `--auto-commit/--no-auto-commit`, `--retention COUNT`,
+`--retention-count N`, `--retention-age 30d`, `--clear-retention`
+(refused while auto-commit stays enabled). `target list` shows an
+`auto-commit` column (`yes`/`no` per file).
 
 ### Review (read-only) & save (explicit)
 
@@ -400,8 +423,11 @@ versioneer service run [--once] [--host HOST]  # daemon loop; systemd ExecStart 
 
 Timers fire `service run --once` (user + system). `check_interval="inotify"`
 is immediate mode via the optional `watchdog` dependency with a tight-poll
-fallback. Daemon writes are zero by default; `auto_commit=true` (per config)
-allows silent commits, `auto_push=true` additionally pushes.
+fallback. Daemon writes are zero by default; config `auto_commit=true` or
+per-target `auto_commit=true` (requires limited `retention.count`, warns that
+frequent commits could take up space quickly) allows silent commits,
+`auto_push=true` additionally pushes. `service check` prints the space warning
+on every auto-commit and any `auto-commit refused` errors (see §8).
 
 ### Uninstall
 
@@ -538,9 +564,25 @@ flowchart TB
 - Checks on system start + every interval (global default `3h`, overridable per config/target:
   `check_interval = "5m"`, `"10s"` for tests, `"inotify"` for immediate savegame/snippet mode via `watchdog`).
 - Per-config `notify = true|false` — noisy savegame configs can commit silently and notify on errors only (damping: max one notification per interval).
+- Per-target `auto_commit = true|false` (autocommittable files): the daemon
+  silently commits drift for that file only, even when the config itself is
+  manual. Only available with limited `retention.count` (e.g. `{count=30}`);
+  enabling — and every daemon auto-commit — warns that frequent commits
+  could take up space quickly. Toggle on tracked files with
+  `target set <path> --auto-commit/--no-auto-commit`.
+- Refusal guard (messed-up store safety): a per-target auto-commit never sweeps
+  in other files. If the store index holds staged changes belonging to
+  non-autocommittable targets (staged but never committed explicitly), the daemon
+  refuses with `auto-commit refused: non-autocommittable files have staged
+  changes: …` and commits nothing — resolve with an explicit
+  `versioneer -C <name> commit`. Only staged changes trigger this (`git commit`
+  commits the index; unstaged/untracked dirt is ignored). Whole-config
+  `auto_commit=true` keeps legacy behavior (every target is auto-committable,
+  guard skipped).
 - System unit only **reads** fixed targets. Unreadable files → `read-error`
   ("run `versioneer status` as root"), never a push warning.
-- Zero git writes by default (asserted in tests); writes happen only with `auto_commit=true`.
+- Zero git writes by default (asserted in tests); writes happen only with
+  config `auto_commit=true` or per-target `auto_commit=true`.
 - Game-exit hook pattern (shipped as unit template):
 
   ```bash
@@ -620,7 +662,9 @@ failure = per-target `error` with output captured in the deploy-status file.
 versioneer doctor
 # checks: git-lfs present, upstream reachable/auth, disk quota,
 # read-errors, large files vs large_file_warn_mb, dangling symlinks,
-# missing validators, retention status. Exit != 0 on errors.
+# missing validators, retention status, per-target auto_commit (requires
+# limited retention.count; enabling/firing warns about space use).
+# Exit != 0 on errors.
 ```
 
 ---
@@ -718,6 +762,10 @@ deploy_path = ""                 # required for flexi (--to at deploy)
 machines = []                    # [] = all hosts, else ["laptop"]
 check_interval = ""              # per-target override ("5m", "inotify"), else meta value
 retention = { count = 3 }        # e.g. {count=30, age="30d"} for saves; warn-only + opt-in prune
+auto_commit = false            # per-file auto-commit (daemon commits drift silently);
+                               # only with limited retention.count; enabling/firing warns
+                               # that frequent commits could take up space quickly.
+                               # Toggle via `target set <path> --auto-commit/--no-auto-commit`.
 template = false                 # {{HOME}}/{{HOST}} substitution on deploy
 on_deploy = ""                   # e.g. "hyprctl reload"
 encrypt = false                  # sops/age per-target encryption; warn-only when sops absent
@@ -778,7 +826,8 @@ Uninstalled/broken service → `status` still works manually; only background ch
 | `sudo vers: command not found` | means the `/usr/local/bin` shims are missing — `~/.local/bin` is not in sudo `secure_path`. Fix: re-run `./installer/install.sh` (shims are installed by default, sudo is used once just for those two files; `--no-system-shim` skips them). Tracking root-owned files does NOT need `sudo vers`: just run `vers target add /etc/...` as your user (sudo read is automatic, password prompted once). Do not run the whole installer with sudo in the normal case (it works — files still target your user — but it is unnecessary). |
 | `target add /etc/...` says `permission denied` | ensure your user has sudo access — you will be prompted once; TOML + store stay owned by you. Dir targets still need direct read access |
 | `target add` says `path does not exist` for a root-owned path | it distinguishes missing (`ENOENT`) from denied (`EACCES`): denied paths now elevate via sudo instead of reporting missing. If truly missing, it suggests close names (e.g. `/etc/security/faillock` vs `faillock.conf`) |
-| daemon spams savegame notifs | set `check_interval="5m"` + `auto_commit=true`, add `ignore` for `Cache/*.log` |
+| daemon spams savegame notifs | set `check_interval="5m"` + config `auto_commit=true` or per-target `--auto-commit`, add `ignore` for `Cache/*.log` |
+| `auto-commit refused: non-autocommittable files have staged changes` | store index is messed up (something staged but never committed) — per-target auto-commit refuses to sweep it in. Run `versioneer -C <name> status`, then commit explicitly with `versioneer -C <name> commit` |
 | binary > 10 MB warning | expected for saves/prefixes; confirm LFS, or split target / use manifest |
 | `flexi` deploy fails | pass `--to <path>` or set `deploy_path`; entry fails alone, run continues |
 | destination missing | recorded as `error` in deploy-status; create parent dir or `--to` elsewhere |

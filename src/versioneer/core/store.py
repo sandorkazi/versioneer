@@ -194,6 +194,25 @@ def _has_staged_changes(store: Path) -> bool:
     return proc.returncode != 0
 
 
+def staged_files(store: Path) -> list[str]:
+    """Staged paths (vs HEAD) as posix rels; [] on non-repo/error.
+
+    Used by the per-target auto-commit guard: a silent auto-commit must
+    never sweep in pre-existing staged changes belonging to
+    non-autocommittable targets (messed-up state: files staged but never
+    committed explicitly). Only staged changes matter — ``git commit``
+    without ``-a`` commits the index, so unstaged worktree dirt and
+    untracked files are safe and ignored here.
+    """
+    if not is_repo(store):
+        return []
+    try:
+        out = _run_git(["diff", "--cached", "--name-only"], store)
+    except GitError:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
 def add_and_commit(store: Path, rel_paths: list[str], message: str) -> str | None:
     ensure_repo(store)
     try:

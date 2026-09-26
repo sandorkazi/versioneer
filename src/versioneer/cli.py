@@ -412,6 +412,14 @@ def target_grp(ctx):
     help="Encrypt store artifact via sops/age (warn-only when sops absent).",
 )
 @click.option(
+    "--auto-commit/--no-auto-commit",
+    "target_auto_commit",
+    default=False,
+    show_default=True,
+    help="Per-target auto-commit opt-in (daemon commits drift silently). "
+    "Requires --retention-count N (limited revisions kept).",
+)
+@click.option(
     "--force",
     is_flag=True,
     default=False,
@@ -438,6 +446,7 @@ def target_add(
     deploy_path,
     check_interval,
     encrypt,
+    target_auto_commit,
     force,
 ):
     """Start tracking PATH from now (baseline + commit, no backfill)."""
@@ -488,6 +497,12 @@ def target_add(
         retention["count"] = count
     if retention_age:
         retention["age"] = retention_age
+    if target_auto_commit and not cfg.has_limited_retention(retention):
+        raise click.ClickException(
+            "--auto-commit requires limited retention: "
+            "pass --retention-count N (e.g. --retention-count 30) "
+            "so auto-committed revisions stay bounded"
+        )
 
     store = cfg.store_dir(config)
     try:
@@ -683,10 +698,15 @@ def target_add(
             on_deploy=on_deploy,
             encrypt=bool(encrypt or config.meta.encrypt),
             auto_add_glob=auto_add_glob or "",
+            auto_commit=bool(target_auto_commit),
         )
         errors = target.validate(config.meta.root)
         if errors:
             raise click.ClickException("; ".join(errors))
+        if bool(target_auto_commit):
+            console.print(
+                f"[yellow]warn[/yellow]: {stored_path}: {cfg.AUTO_COMMIT_SPACE_WARNING}"
+            )
 
         # stage artifact copy inside the store repo
         if effective_root:
@@ -864,11 +884,146 @@ def target_list(ctx):
     table.add_column("flex")
     table.add_column("hash")
     table.add_column("owner/mode")
+    table.add_column("auto-commit")
     for t in config.targets:
         assert isinstance(t, cfg.Target)
         short = (t.hash[:19] + "…") if len(t.hash) > 19 else t.hash
-        table.add_row(t.path, t.kind, t.flex, short, f"{t.owner}/{t.mode}")
+        table.add_row(
+            t.path,
+            t.kind,
+            t.flex,
+            short,
+            f"{t.owner}/{t.mode}",
+            "yes" if bool(getattr(t, "auto_commit", False)) else "no",
+        )
     console.print(table)
+
+
+@target_grp.command("set")
+@click.argument("path")
+@click.option(
+    "--auto-commit/--no-auto-commit",
+    "target_auto_commit",
+    default=None,
+    help="Toggle per-target auto-commit (daemon commits drift silently). "
+    "Enabling requires limited retention (--retention-count N).",
+)
+@click.option(
+    "--retention",
+    "retention_shorthand",
+    type=int,
+    default=None,
+    help="Shorthand for --retention-count.",
+)
+@click.option("--retention-count", type=int, default=None)
+@click.option("--retention-age", default=None, help="E.g. 30d.")
+@click.option(
+    "--clear-retention",
+    is_flag=True,
+    default=False,
+    help="Clear the retention policy (refused while auto-commit is enabled).",
+)
+@click.pass_context
+def target_set(
+    ctx, path, target_auto_commit, retention_shorthand, retention_count, retention_age,
+    clear_retention,
+):
+    """Toggle auto-commit / retention on an already tracked target.
+
+    \b
+    versioneer -C saves target set saves/slot1.sav --auto-commit --retention-count 30
+    versioneer -C saves target set saves/slot1.sav --no-auto-commit
+    """
+    from versioneer.core import monitor as _mon
+    from versioneer.core import store as _store
+
+    name = _require_config(ctx)
+    try:
+        config = cfg.load(name)
+    except FileNotFoundError:
+        raise click.ClickException(f"config {name!r} not found in {cfg.config_dir()}")
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    target = cfg.find_target(config, path)
+    if target is None:
+        try:
+            stored, abs_p = _mon.resolve_input(path, config.meta.root or "")
+            target = cfg.find_target(config, stored) or cfg.find_target(config, str(abs_p))
+        except ValueError:
+            target = None
+    if target is None:
+        raise click.ClickException(f"not tracked: {path!r}")
+    assert isinstance(target, cfg.Target)
+
+    if (
+        target_auto_commit is None
+        and retention_shorthand is None
+        and retention_count is None
+        and retention_age is None
+        and not clear_retention
+    ):
+        raise click.ClickException(
+            "nothing to change: pass --auto-commit/--no-auto-commit "
+            "and/or --retention-count N [--retention-age AGE]"
+        )
+    if clear_retention and (
+        retention_shorthand is not None or retention_count is not None or retention_age
+    ):
+        raise click.ClickException("pass either --clear-retention or retention values, not both")
+
+    new_retention = dict(target.retention or {})
+    if clear_retention:
+        new_retention = {}
+    else:
+        count = retention_count if retention_count is not None else retention_shorthand
+        if count is not None:
+            new_retention["count"] = count
+        if retention_age:
+            new_retention["age"] = retention_age
+    new_auto = bool(getattr(target, "auto_commit", False))
+    if target_auto_commit is not None:
+        new_auto = bool(target_auto_commit)
+
+    if new_auto and not cfg.has_limited_retention(new_retention):
+        raise click.ClickException(
+            "--auto-commit requires limited retention: "
+            "pass --retention-count N (e.g. --retention-count 30) "
+            "so auto-committed revisions stay bounded"
+        )
+    if clear_retention and bool(getattr(target, "auto_commit", False)) and new_auto:
+        raise click.ClickException(
+            "cannot clear retention while auto-commit is enabled "
+            "(pass --no-auto-commit together with --clear-retention)"
+        )
+
+    target.retention = new_retention
+    target.auto_commit = new_auto
+    errors = target.validate(config.meta.root)
+    if errors:
+        raise click.ClickException("; ".join(errors))
+    try:
+        cfg.save(config)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    store = cfg.store_dir(config)
+    try:
+        cfg.export_snapshot(config, store)
+        try:
+            _store.add_and_commit(
+                store, [cfg.SNAPSHOT_NAME], f"target set {target.path}"
+            )
+        except _store.GitError:
+            pass
+    except (ValueError, OSError) as e:
+        console.print(f"[yellow]warn[/yellow]: snapshot refresh skipped: {e}")
+    if target_auto_commit is True:
+        console.print(
+            f"[yellow]warn[/yellow]: {target.path}: {cfg.AUTO_COMMIT_SPACE_WARNING}"
+        )
+    console.print(
+        f"[green]updated[/green] {target.path} "
+        f"(auto_commit={'yes' if new_auto else 'no'}, retention={new_retention or '{}'})"
+    )
 
 
 @target_grp.command("remove")
@@ -1813,11 +1968,19 @@ def service_check(ctx, all_configs, host):
             )
             for d in r["drift"][:10]:
                 console.print(f"  {d['target']} {d['state']}")
+            for w in r.get("warnings", []):
+                console.print(f"[yellow]warn[/yellow]: {w}")
+            for e in r.get("errors", []):
+                console.print(f"[red]error[/red]: {e}")
         return
     r = _daemon.check_once(name, host or "")
     console.print(f"{name}: {len(r['drift'])} drifted")
     for d in r["drift"][:20]:
         console.print(f"  {d['target']} {d['state']}: {d['detail']}")
+    for w in r.get("warnings", []):
+        console.print(f"[yellow]warn[/yellow]: {w}")
+    for e in r.get("errors", []):
+        console.print(f"[red]error[/red]: {e}")
 
 
 def _infer_targets_from_store(store_path: Path) -> list:
@@ -2392,6 +2555,18 @@ def doctor(ctx, secrets_only):
                 w = _store.retention_warning(n, t.retention)
                 if w:
                     console.print(f"  [yellow]warn[/yellow] {t.path}: {w}")
+                    warnings += 1
+            if bool(getattr(t, "auto_commit", False)):
+                if not cfg.has_limited_retention(getattr(t, "retention", {})):
+                    console.print(
+                        f"  [red]error[/red] {t.path}: auto_commit=true "
+                        "requires limited retention (set retention.count >= 1)"
+                    )
+                    errors += 1
+                else:
+                    console.print(
+                        f"  [yellow]warn[/yellow] {t.path}: {cfg.AUTO_COMMIT_SPACE_WARNING}"
+                    )
                     warnings += 1
             # secrets audit (live file scan)
             live = r["abs_path"]
