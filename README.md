@@ -3,7 +3,7 @@
 > Service-based file and config monitoring for Linux — primarily CachyOS / Arch.
 > Track what matters, get notified on drift, review explicitly, restore safely on a new machine.
 
-Versioneer is **git + git-lfs with a brain for Linux configs**: it watches files you declare
+Versioneer is **plain git with a brain for Linux configs**: it watches files you declare
 (`hyprland.conf`, `fstab`, savegames, wine recipes, `~/bin` snippets), tells you when they drift,
 and redeploys them safely (backup → atomic write → permission restore → validation hook).
 
@@ -14,7 +14,10 @@ It is **not** a blind backup tool (like `rsync`/`restic`) and **not** a dotfile 
 > `versioneer --help`, `config create/list/show/remove`, `target add/list/remove/set`
 > (incl. `--force` wine escape hatch, `--encrypt` warn-only, `--auto-add-glob`,
 > per-target `--auto-commit` with limited retention),
-> `status/diff/log` (incl. `status --host`), `commit` (incl. `--prune-retention`)
+> `status/diff/log` (incl. `status --host`), `commit` (retention warn-only,
+> `--prune-retention` deprecated), nonversioned `file://` remote for binaries
+> (`target add --remote-root`, `target set --remote-retention/--clear-remote`,
+> keep-last-N rotation enforced on the remote)
 > /`push`/`pull`, `deploy` (dry-run, `--plan-out`/`--plan`, backup, atomic write,
 > perm restore, `--prune`, `--host`/`--force-host`, `--to`, `--yes`/`--no-interaction`,
 > `--apply` for packages/systemd/wine), `service install/enable/disable/check/run`
@@ -27,11 +30,11 @@ It is **not** a blind backup tool (like `rsync`/`restic`) and **not** a dotfile 
 > `doctor [--secrets]` all work from source (`pip install -e .` or
 > `./installer/install.sh --dev`).
 > Secret scan + `encrypt=true` are warn-only in v1 (plaintext kept when
-> `sops`/`age` absent, never blocks). Retention is warn-by-default with opt-in
-> `--prune-retention` / `commit --prune-retention` (history kept, never squashes,
-> so `plan.json` hashes stay valid).
+> `sops`/`age` absent, never blocks). Retention is warn-only (history kept,
+> never squashes, so `plan.json` hashes stay valid; `--prune-retention` is
+> deprecated since LFS removal — see [§17](#17-roadmap)).
 > Prerequisites: Arch/CachyOS (or any systemd Linux),
-> Python 3.12+, `git`, `git-lfs`, a private git host with SSH auth,
+> Python 3.12+, `git`, a private git host with SSH auth,
 > `notify-send`/D-Bus for notifications (fallback: stdout/journal), optional `sops`+`age`,
 > optional `watchdog` for `inotify` immediacy.
 > See [§4](#4-installation) for the full checklist.
@@ -56,6 +59,7 @@ It is **not** a blind backup tool (like `rsync`/`restic`) and **not** a dotfile 
 - [14. Storage layout](#14-storage-layout)
 - [15. Troubleshooting / FAQ](#15-troubleshooting--faq)
 - [16. Uninstall](#16-uninstall)
+- [17. Roadmap](#17-roadmap)
 
 ---
 
@@ -77,7 +81,7 @@ flowchart TB
         USER -->|deploy| CLI
     end
     subgraph Store["Versioned store (one git repo per config)"]
-        REPO["~/versioneer-store/hypr/<br/>git + LFS"]
+        REPO["~/versioneer-store/hypr/<br/>plain git"]
         REPO -->|push/pull| UP["upstream git URL<br/>(private repo recommended)"]
     end
     CLI <-->|commit / deploy| REPO
@@ -86,8 +90,9 @@ flowchart TB
 **Three planes:**
 
 1. **Declared state** — `~/.config/versioneer/<name>.toml` lists targets + last-known `hash/owner/mode`.
-2. **Versioned store** — one plain git (+ LFS) repo per config, e.g. `~/versioneer-store/hypr/`.
-   Text = normal git, binary/savegames = LFS, manifests = generated recipes.
+2. **Versioned store** — one plain git repo per config, e.g. `~/versioneer-store/hypr/`.
+   Text = normal git, binary/savegames = plain git objects (full history kept;
+   LFS removed, see [§17](#17-roadmap)), manifests = generated recipes.
 3. **Live filesystem** — what is actually on disk right now.
 
 The daemon only **compares 1 vs 3** and notifies. Only you (or an explicit
@@ -134,7 +139,8 @@ Every target has three independent axes:
 | **interest**   | `state` `diff`                                      | do you care about whole file or what changed                   |
 
 Plus practical fields: `glob`, `ignore`, `symlink`, `machines`, `retention`,
-`auto_commit` (per-file auto-commit, requires limited `retention.count`),
+`auto_commit` (per-file auto-commit, requires limited `retention.count`
+or a remote target with `remote.retention`),
 `template`, `on_deploy` (see [§13](#13-config-file-reference)).
 
 - **flex:**
@@ -144,11 +150,24 @@ Plus practical fields: `glob`, `ignore`, `symlink`, `machines`, `retention`,
   - `flexi` — no fixed destination. You supply `--to <path>` (or get prompted) at deploy time.
 - **kind:**
   - `text` — normal git + unified diff. Hypr, firejail, fstab, snippets.
-  - `binary` — git-LFS + size warning (`large_file_warn_mb`, default ~10 MB).
-    Default retention `count=3`; savegames override to e.g. `{count=30, age="30d"}`.
+  - `binary` — plain git objects + size warning (`large_file_warn_mb`, default ~10 MB).
+    Default retention (warn-only, no automatic pruning) `count=3`; savegames override to e.g. `{count=30, age="30d"}`.
   - `dir` — snapshot of file list + per-file handling. New files = `untracked` candidates, never auto-added
     (unless `watch --auto-add` for snippets).
   - `manifest` — generated recipe, not a copy (package list, wine recipe — see [§10](#10-manifests-packages-wine-systemd-env)).
+
+**Remote route (orthogonal to kind):** a text/binary target can live on a
+nonversioned remote instead of git (`target add --remote-root <abs-path>`
+`[--remote-backend file] [--remote-retention N]`, default keep-last-3).
+Git holds only a small pointer file; content revisions live under
+`<root>/<artifact-rel>/` with keep-last-N rotation enforced at commit time
+— exactly N revisions, unlike git history which keeps everything. `status`
+shows `[remote]`, `log` lists blob revisions, `diff`/`deploy` fetch the
+latest blob (offline-safe errors when the remote is unreachable).
+`target set` attaches/retunes/detaches
+(`--remote-root/--remote-retention/--clear-remote`); `target remove` keeps
+remote blobs (purge manually). dir/manifest remotes and remote+encrypt are
+rejected in v1; only the `file` backend exists (ftp/drive planned).
 - **symlink:** `preserve` (default — recreate the link) vs `follow` (dereference content).
 
 ### Drift states (what `status` reports)
@@ -175,7 +194,7 @@ flowchart LR
     S --> C["commit + push<br/>save (explicit)"]
     C --> S
     D["daemon<br/>hash+stat compare<br/>notify only"] -->|drift?| S
-    C --> ST["store<br/>git + LFS"]
+    C --> ST["store<br/>plain git"]
     ST --> DP["deploy<br/>dry-run → plan → rollout"]
     DP --> FS["filesystem"]
     FS --> D
@@ -211,8 +230,8 @@ Rules (authoritative, from `implementation_plan.md §0`):
 Arch / CachyOS (recommended):
 
 ```bash
-sudo pacman -S git git-lfs python-pipx
-git lfs install
+sudo pacman -S git python-pipx
+# LFS is gone (removed; plain git only) — no `git lfs install` step.
 # optional hardening + immediacy:
 sudo pacman -S sops age
 pip install 'versioneer[inotify]'   # optional watchdog for check_interval="inotify"
@@ -243,8 +262,7 @@ What the installer does (see `installer/install.sh --help`):
   `VERSIONEER_VENV_DIR` or `--venv DIR` to override) and installs versioneer
   into it (`-e` with `--dev`, regular install otherwise) — never `pipx`/`uv`
   shims, never a system package, never system-python site installs;
-- preflight (fail or warn-only): requires `python3` ≥ 3.12 and `git`;
-  warns (never blocks) when `git-lfs` is missing;
+- preflight (fail fast): requires `python3` ≥ 3.12 and `git`;
 - installs shell completions (bash/fish/zsh — CLI is shell-agnostic) unless
   `--no-completions`;
 - does **not** prompt for upstreams — upstreams are set per config at
@@ -254,9 +272,9 @@ What the installer does (see `installer/install.sh --help`):
   `service run --once`, stages system units for manual `sudo cp`;
   see [§8](#8-monitor-engine--systemd-service));
 - `versioneer doctor` re-validates everything
-  (LFS, upstream reachability, disk, units, completions, `sops`/`age`).
+  (upstream reachability, disk, units, completions, `sops`/`age`).
 
-Requirements: Python 3.12+, `git`, `git-lfs`, `systemd`, `notify-send`/D-Bus (fallback: stdout/journal).
+Requirements: Python 3.12+, `git`, `systemd`, `notify-send`/D-Bus (fallback: stdout/journal).
 
 ---
 
@@ -357,12 +375,19 @@ versioneer -C hypr target list
 versioneer -C hypr target remove ~/.config/hypr/old.conf
 
 # per-file auto-commit (autocommittable files): daemon commits drift silently.
-# Only available with limited retention; enabling warns that frequent
-# commits could take up space quickly.
+# Only available with limited retention (git retention.count, or a remote
+# target); enabling warns that frequent commits could take up space quickly.
 versioneer -C savegames target add ~/saves/slot1.sav \
   --auto-commit --retention-count 30 --retention-age 30d
 versioneer -C savegames target set ~/saves/slot1.sav --auto-commit --retention-count 30
 versioneer -C savegames target set ~/saves/slot1.sav --no-auto-commit
+
+# nonversioned remote instead of git (file backend, keep-last-N on the remote,
+# pointer in git; text|binary only, no dir/manifest, no encrypt):
+versioneer -C savegames target add ~/saves/slot1.sav --kind binary \
+  --remote-root /mnt/drive/vers-remote --remote-retention 5
+versioneer -C savegames target set ~/saves/slot1.sav --remote-retention 3
+versioneer -C savegames target set ~/saves/slot1.sav --clear-remote
 ```
 
 `add` also runs two lints (warn-only): **secret scan** (possible token/key → suggest
@@ -378,14 +403,19 @@ Full `target add` flags: `--root DIR`, `--kind text|binary|dir|auto`
 `--on-deploy CMD`, `--deploy-path PATH` (flexi), `--check-interval 5m|inotify`,
 `--encrypt/--no-encrypt` (warn-only when `sops`/`age` absent, never blocks),
 `--auto-commit/--no-auto-commit` (per-target auto-commit; requires
-`--retention-count N`, warns that frequent commits could take up space quickly),
-`--force` (required escape hatch for whole wine-prefix dirs; manifest-only is default).
+`--retention-count N` or a `--remote-root` target, warns that frequent
+commits could take up space quickly),
+`--force` (required escape hatch for whole wine-prefix dirs; manifest-only is default),
+`--remote-root PATH` (nonversioned remote, file backend, absolute path),
+`--remote-backend file` (v1 only), `--remote-retention N` (keep-last-N, default 3).
 
-`target set <path>` toggles autocommittability / retention on an already
+`target set <path>` toggles autocommittability / retention / remote on an already
 tracked file: `--auto-commit/--no-auto-commit`, `--retention COUNT`,
 `--retention-count N`, `--retention-age 30d`, `--clear-retention`
-(refused while auto-commit stays enabled). `target list` shows an
-`auto-commit` column (`yes`/`no` per file).
+(refused while auto-commit stays enabled), `--remote-root PATH` (attach/migrate
+git content to the remote), `--remote-retention N` (retune, enforced immediately),
+`--clear-remote` (detach/migrate back to git). Git `--retention-*` flags are
+refused on remote targets. `target list` shows `auto-commit` and `remote` columns.
 
 ### Review (read-only) & save (explicit)
 
@@ -398,15 +428,15 @@ versioneer -C hypr log <target>
 
 versioneer -C hypr commit -m "msg" <target>...
 versioneer -C savegames commit --all -m "post-session"   # bulk savegame style
-versioneer -C hypr commit --all --prune-retention  # opt-in local `git lfs prune` when retention exceeds
+versioneer -C hypr commit --all  # retention warn-only; --prune-retention deprecated
 versioneer -C hypr push
 versioneer -C hypr pull              # offline-safe: status/commit work offline, push/pull defer with message
 ```
 
 Locked savegames (SQLite WAL, game still running) are copied-then-hashed with a warning,
 never hashed in place. Retention (`retention = {count, age}`, default `count=3`
-for `binary`) warns on `commit` by default; `--prune-retention` opts into a local
-`git lfs prune` (history kept, never squashes, so `plan.json` hashes stay valid).
+for `binary`) warns on `commit`; history kept, never squashes, so `plan.json`
+hashes stay valid (`--prune-retention` deprecated since LFS removal).
 
 ### Service
 
@@ -424,8 +454,9 @@ versioneer service run [--once] [--host HOST]  # daemon loop; systemd ExecStart 
 Timers fire `service run --once` (user + system). `check_interval="inotify"`
 is immediate mode via the optional `watchdog` dependency with a tight-poll
 fallback. Daemon writes are zero by default; config `auto_commit=true` or
-per-target `auto_commit=true` (requires limited `retention.count`, warns that
-frequent commits could take up space quickly) allows silent commits,
+per-target `auto_commit=true` (requires limited `retention.count` or a remote
+target, warns that frequent commits could take up space quickly) allows
+silent commits (remote targets push blobs + rotate, no sudo prompts),
 `auto_push=true` additionally pushes. `service check` prints the space warning
 on every auto-commit and any `auto-commit refused` errors (see §8).
 
@@ -477,7 +508,8 @@ versioneer bootstrap <upstream-git-url> [--to DIR] [--host HOST] [--dry-run] [--
 # all configs already declared in ~/.config/versioneer/:
 versioneer bootstrap --all [--host HOST]
 # = clone store(s) + recreate TOML(s) from the store-side .versioneer.toml
-#   snapshot (best-effort adopt when snapshot-less) + deploy
+#   snapshot (best-effort adopt when snapshot-less, incl. [targets.remote]) + deploy
+#   (remote targets fetch blobs from the remote — it must be reachable)
 # --dry-run: preview only (clone + deploy --dry-run, no writes, no status file)
 # --yes: assume yes for deploy overwrites
 # recommended: bootstrap --dry-run (or deploy --dry-run) first
@@ -566,9 +598,9 @@ flowchart TB
 - Per-config `notify = true|false` — noisy savegame configs can commit silently and notify on errors only (damping: max one notification per interval).
 - Per-target `auto_commit = true|false` (autocommittable files): the daemon
   silently commits drift for that file only, even when the config itself is
-  manual. Only available with limited `retention.count` (e.g. `{count=30}`);
-  enabling — and every daemon auto-commit — warns that frequent commits
-  could take up space quickly. Toggle on tracked files with
+  manual. Only available with limited `retention.count` (e.g. `{count=30}`)
+  or a remote target (rotation bounds space); enabling — and every daemon
+  auto-commit — warns that frequent commits could take up space quickly. Toggle on tracked files with
   `target set <path> --auto-commit/--no-auto-commit`.
 - Refusal guard (messed-up store safety): a per-target auto-commit never sweeps
   in other files. If the store index holds staged changes belonging to
@@ -660,10 +692,11 @@ failure = per-target `error` with output captured in the deploy-status file.
 
 ```bash
 versioneer doctor
-# checks: git-lfs present, upstream reachable/auth, disk quota,
+# checks: upstream reachable/auth, disk quota,
 # read-errors, large files vs large_file_warn_mb, dangling symlinks,
-# missing validators, retention status, per-target auto_commit (requires
-# limited retention.count; enabling/firing warns about space use).
+# missing validators, retention status (git + remote blob counts),
+# per-target auto_commit (requires limited retention.count or a remote
+# target; enabling/firing warns about space use).
 # Exit != 0 on errors.
 ```
 
@@ -702,6 +735,10 @@ versioneer -C savegames target add ~/.local/share/Steam/... --kind dir \
 versioneer -C savegames commit --all -m "checkpoint"
 # single-file restore:
 versioneer -C savegames deploy "saves/slot1.sav"
+# bounded-space alternative for single files (exactly N revisions on a drive,
+# pointer in git; dir targets stay in git for now):
+versioneer -C savegames target add ~/saves/slot1.sav --kind binary \
+  --remote-root /mnt/drive/vers-remote --remote-retention 5
 ```
 
 ### D. Wine (know what's installed, no re-cooking)
@@ -761,14 +798,21 @@ interest = "state"               # state|diff (v1: diff previews diff, deploys s
 deploy_path = ""                 # required for flexi (--to at deploy)
 machines = []                    # [] = all hosts, else ["laptop"]
 check_interval = ""              # per-target override ("5m", "inotify"), else meta value
-retention = { count = 3 }        # e.g. {count=30, age="30d"} for saves; warn-only + opt-in prune
+retention = { count = 3 }        # e.g. {count=30, age="30d"} for saves; warn-only (no automatic pruning since LFS removal)
 auto_commit = false            # per-file auto-commit (daemon commits drift silently);
-                               # only with limited retention.count; enabling/firing warns
-                               # that frequent commits could take up space quickly.
+                               # only with limited retention.count or a remote target;
+                               # enabling/firing warns that frequent commits
+                               # could take up space quickly.
                                # Toggle via `target set <path> --auto-commit/--no-auto-commit`.
 template = false                 # {{HOME}}/{{HOST}} substitution on deploy
 on_deploy = ""                   # e.g. "hyprctl reload"
 encrypt = false                  # sops/age per-target encryption; warn-only when sops absent
+
+[targets.remote]               # nonversioned remote (written by target add/set --remote-*)
+backend = "file"               # v1: file only (ftp/drive planned)
+root = "/mnt/drive/vers-remote"  # absolute path; blobs live under <root>/<artifact-rel>/
+retention = 5                  # keep-last-N blob revisions (default 3); enforced at commit
+```
 
 [targets.manifest]               # only when kind="manifest" (written by `manifest`, not `target add`)
 type = "wine"                    # packages|wine|systemd|env
@@ -778,7 +822,7 @@ output = "wine-manifest.json"
 
 `encrypt` falls back to `meta.encrypt` when unset per target; both are warn-only
 in v1 (plaintext kept + `doctor`/lint warning when `sops`/`age` absent, never blocks).
-Empty `manifest` subtables are omitted on save (subtable only for `kind="manifest"`).
+Empty `manifest`/`remote` subtables are omitted on save (each only when configured).
 Every `target add`/`commit`/`manifest` also exports a store-side snapshot
 (`<store>/.versioneer.toml`) so `bootstrap <url>` recreates exact TOMLs on a new machine.
 
@@ -788,7 +832,7 @@ Every `target add`/`commit`/`manifest` also exports a store-side snapshot
 
 ```text
 ~/.config/versioneer/<name>.toml        # declared state + baselines
-~/versioneer-store/<name>/              # git + LFS repo (one per config)
+~/versioneer-store/<name>/              # plain git repo (one per config)
 ~/.local/state/versioneer/
   <config>-deploy-<timestamp>.json      # per-target ok|skipped|error + hook output
   <config>-latest.json -> <config>-deploy-<timestamp>.json  # symlink to newest
@@ -796,11 +840,15 @@ Every `target add`/`commit`/`manifest` also exports a store-side snapshot
 ```
 
 - `text` → normal git objects, word diff.
-- `binary` → LFS (`*.bin` + explicit binary targets), `large_file_warn_mb` alert,
-  `retention = {count, age}` warns on commit by default; opt-in
-  `commit --prune-retention` runs a local `git lfs prune` (history kept, never squashes).
+- `binary` → plain git objects (LFS removed), size alert via `large_file_warn_mb`,
+  `retention = {count, age}` warns on commit; history kept, never squashes
+  (`--prune-retention` deprecated since LFS removal).
 - `target remove` = `git rm` + commit; history kept (full purge via `git filter-repo` documented).
+  For remote targets the pointer is removed; remote blobs are kept (purge manually).
 - `<store>/.versioneer.toml` → store-side TOML snapshot (written on add/commit/manifest) for `bootstrap`.
+- remote (`file` backend): `<root>/<artifact-rel>/rev-<timestamp>-<sha>.blob`
+  (exactly keep-last-N; git holds `<artifact-rel>.remote.json` pointers only).
+  Deploy/diff fetch the latest blob into `~/.local/state/versioneer/remote-cache/`.
 
 ---
 
@@ -828,19 +876,21 @@ Uninstalled/broken service → `status` still works manually; only background ch
 | `target add` says `path does not exist` for a root-owned path | it distinguishes missing (`ENOENT`) from denied (`EACCES`): denied paths now elevate via sudo instead of reporting missing. If truly missing, it suggests close names (e.g. `/etc/security/faillock` vs `faillock.conf`) |
 | daemon spams savegame notifs | set `check_interval="5m"` + config `auto_commit=true` or per-target `--auto-commit`, add `ignore` for `Cache/*.log` |
 | `auto-commit refused: non-autocommittable files have staged changes` | store index is messed up (something staged but never committed) — per-target auto-commit refuses to sweep it in. Run `versioneer -C <name> status`, then commit explicitly with `versioneer -C <name> commit` |
-| binary > 10 MB warning | expected for saves/prefixes; confirm LFS, or split target / use manifest |
+| binary > 10 MB warning | expected for saves/prefixes; split target / use manifest, or move to the planned nonversioned remote |
 | `flexi` deploy fails | pass `--to <path>` or set `deploy_path`; entry fails alone, run continues |
 | destination missing | recorded as `error` in deploy-status; create parent dir or `--to` elsewhere |
 | interim edit between plan and deploy | re-hash flags it as deployment error — re-run `--plan-out` |
+| remote unreachable on diff/deploy/log | offline-safe per-target error — check the drive is mounted / path exists, then retry |
+| remote has no revisions | run `commit` first (blobs are created on add/commit, never backfilled) |
 | hardcoded `/home/alice` after restore | enable `template=true`, use `{{HOME}}` |
 | laptop vs desktop diverge | `machines=["laptop"]` + `{{HOST}}`, or per-machine branches (merge cost documented) |
-| `doctor` red | follow its list: `git-lfs`, upstream auth, disk, dangling symlinks, validators |
+| `doctor` red | follow its list: upstream auth, disk, dangling symlinks, validators |
 | pushed a secret | rotate it now — git history keeps it; then enable `encrypt=true` (`sops/age`) |
 | `command not found: versioneer` | activate the venv (`source ~/.local/share/versioneer/venv/bin/activate`) or add it to `PATH`; reinstall via `./installer/install.sh --dev` |
 | `encrypt=true` but plaintext | expected when `sops`/`age` absent (warn-only in v1) — `sudo pacman -S sops age`, then `commit` again |
 | whole wine prefix tracked | manifest-only is default; `target add <prefix>` without `--force` refuses — use `manifest --wine` + selective `*.reg`, or re-run with `--force` |
 | manifest `deploy` only prints | expected — pass `--apply` (packages: `sudo pacman -S --needed`; systemd: `systemctl enable`; wine: writes `setup-wine.sh`; env: stays print-only) |
-| retention warnings on commit | expected past `retention = {count, age}` — history is kept; pass `commit --prune-retention` for a local `git lfs prune` |
+| retention warnings on commit | expected past `retention = {count, age}` — history is kept (no automatic pruning since LFS removal) |
 
 **Design choices worth knowing:** `diff`-interest deploys state in v1 (true patch-apply is v2);
 dir `merge` never deletes extras unless `--prune`; daemon never auto-pushes unless you opt in.
@@ -859,6 +909,22 @@ versioneer uninstall [--purge-stores] [--yes] [--venv DIR]
 # stores in ~/versioneer-store/<name> are kept unless --purge-stores is passed
 # (second confirm unless --yes)
 ```
+
+---
+
+## 17. Roadmap
+
+Deliberately out of v1 (rejected with an explicit error where applicable):
+
+- **More remote backends** — only `file` exists. `ftp`/`drive` (and rclone-style)
+  go behind the `push/list/fetch/delete` backend interface (`src/versioneer/core/remote.py`).
+- **Dir remotes** — remote targets are `text`/`binary` files only. Savegame dirs
+  stay in git (or track the inner file as a remote `binary`).
+- **Remote encryption** — `remote + encrypt=true` is rejected. Secrets on
+  remotes need envelope encryption per blob (sops/age) before this opens.
+- **History** — LFS was removed entirely (git holds plain objects; binaries in
+  git keep full history with warn-only retention). No automatic history
+  rewriting: deep purges stay manual `git filter-repo` operations.
 
 ---
 

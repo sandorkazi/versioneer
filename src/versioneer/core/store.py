@@ -1,19 +1,22 @@
-"""Git + LFS wrapper (Phase 2: init/clone/commit/push/pull).
+"""Git wrapper (Phase 2: init/clone/commit/push/pull).
 
 Wrapper only — called by CLI and (only with auto_commit opt-in) by daemon/hook.
 Never auto-pushes unless auto_push=true (enforced by callers).
 
+LFS was removed (see README §17 Roadmap): all artifacts are plain git
+objects. Binaries therefore accumulate full history in the store; the
+nonversioned remote backend (planned separately) is the intended home for
+binaries and limited-revision targets.
+
 Q3 decision (c) — per-target ``retention = {count, age}``:
-warn by default + opt-in prune. History is always kept by default; this
-module never rewrites/squashes history (no ``filter-repo``/``rebase``/
-squash) so ``plan.json`` hashes and ``target remove`` history stay intact.
-``commit --prune-retention`` only runs local ``git lfs prune`` (local-only,
-history kept remotely) and prints ``git log`` + ``git lfs prune`` guidance
-for manual quota work.
+warn by default. History is always kept; this module never
+rewrites/squashes history (no ``filter-repo``/``rebase``/squash) so
+``plan.json`` hashes and ``target remove`` history stay intact.
+``commit --prune-retention`` is accepted but deprecated: automatic pruning
+was removed with LFS, so it only prints manual-prune guidance.
 
 Offline behavior: status/commit work offline; push/pull raise GitError with
 an "offline — ..." / "upstream ..." prefix so CLI can defer with a clear message.
-Missing git-lfs degrades to warn-only (plain git still works in tests).
 """
 
 from __future__ import annotations
@@ -45,11 +48,6 @@ def _run_git(args: list[str], cwd: Path) -> str:
     return proc.stdout.strip()
 
 
-def lfs_available() -> bool:
-    """True when git-lfs binary is on PATH."""
-    return shutil.which("git-lfs") is not None
-
-
 def is_repo(store: Path) -> bool:
     return (store / ".git").is_dir() or (store / ".git").is_file()
 
@@ -76,52 +74,6 @@ def ensure_repo(store: Path) -> None:
             _elev.fix_store_after_write(store)
         except (OSError, ImportError):
             pass
-
-
-def ensure_lfs(store: Path, rel_paths: list[str]) -> str | None:
-    """Ensure git-lfs tracks binary artifacts. Returns warning or None.
-
-    Warn-only when git-lfs is missing or `lfs install` fails — plain git
-    still tracks the file (tests + machines without LFS keep working).
-
-    Matching is exact-line (first-field + full-entry), never substring:
-    ``a.bin`` must not match ``xa.bin``.
-    """
-    if not lfs_available():
-        return "git-lfs not found — binary targets need 'pacman -S git-lfs' (warn-only)"
-    try:
-        _run_git(["lfs", "install", "--local"], store)
-    except GitError as e:
-        return f"git lfs install failed: {e} (warn-only)"
-    ga = store / ".gitattributes"
-    existing = ga.read_text(encoding="utf-8", errors="replace") if ga.exists() else ""
-    lines = existing.splitlines()
-    # Exact-line index: full stripped lines + first-field tokens. Substring
-    # matches (e.g. "a.bin" inside "xa.bin ...") must not count as tracked.
-    existing_entries = {ln.strip() for ln in lines if ln.strip()}
-    existing_patterns = {
-        ln.strip().split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")
-    }
-    changed = False
-    for rel in rel_paths:
-        # track exact artifact path + a generic *.bin rule
-        for pattern in (rel, "*.bin"):
-            entry = f"{pattern} filter=lfs diff=lfs merge=lfs -text"
-            if entry in existing_entries or pattern in existing_patterns:
-                continue
-            lines.append(entry)
-            existing_entries.add(entry)
-            existing_patterns.add(pattern)
-            changed = True
-    if changed:
-        ga.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    try:
-        from versioneer.core import elevate as _elev
-
-        _elev.fix_store_after_write(store, rel_paths)
-    except (OSError, ImportError):
-        pass
-    return None
 
 
 def upstream_reachable(store: Path, url: str = "", timeout: int = 10) -> tuple[bool | None, str]:
@@ -251,6 +203,27 @@ def rm_and_commit(store: Path, rel_paths: list[str], message: str) -> str | None
             return None
         _run_git(["commit", "-m", message], store)
         return _run_git(["rev-parse", "HEAD"], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store, rel_paths)
+        except (OSError, ImportError):
+            pass
+
+
+def stage_rm(store: Path, rel_paths: list[str]) -> None:
+    """Stage deletions (``git rm``) without committing. Raises GitError.
+
+    Used when a target's store artifact changes kind (e.g. git content <->
+    remote pointer migrations): the caller batches the staged deletion with
+    new content into a single ``add_and_commit``.
+    """
+    ensure_repo(store)
+    try:
+        if rel_paths:
+            # --cached-safe: artifact lives only in store, so plain rm is right
+            _run_git(["rm", "-r", "--", *rel_paths], store)
     finally:
         try:
             from versioneer.core import elevate as _elev
@@ -533,37 +506,20 @@ def retention_age_warning(
         return (
             f"retention: oldest history {age_s // 86400}d old exceeds "
             f"retention.age={retention.get('age')} "
-            "(history kept; inspect with `git log`, prune LFS locally — see docs)"
+            "(history kept; inspect with `git log` — see docs)"
         )
     return None
 
 
 def prune_guidance(rel_path: str, retention: dict) -> str:
-    """Manual prune guidance (history kept by default, never silent squash)."""
+    """Manual prune guidance (history kept, never silent squash)."""
     return (
-        f"retention prune (opt-in, history kept by default) for {rel_path} "
-        f"{retention}: inspect with `git log --oneline -- {rel_path}`, "
-        f"run `git lfs prune` locally, or `versioneer commit --prune-retention`; "
+        f"retention prune (manual-only, history kept by default) for {rel_path} "
+        f"{retention}: inspect with `git log --oneline -- {rel_path}`; "
+        "automatic pruning was removed with LFS (see README §14 Storage layout); "
         "deep history edits via `git filter-repo` are manual-only "
         "(they change hashes validated by plan.json)"
     )
-
-
-def prune_retention(store: Path, rel_path: str, retention: dict) -> str:
-    """Opt-in local prune: run ``git lfs prune`` (local-only, keeps history).
-
-    Never rewrites/squashes commits (protects plan.json hashes + remove
-    history). Returns human-readable outcome; warn-only when LFS is missing.
-    """
-    _ = retention  # reserved for future per-target prune policy
-    if not lfs_available():
-        return "git-lfs not found — skipping prune (install with `pacman -S git-lfs`; history kept)"
-    try:
-        out = _run_git(["lfs", "prune"], store)
-    except GitError as e:
-        return f"`git lfs prune` skipped: {e} (history kept)"
-    detail = f": {out}" if out else ""
-    return f"`git lfs prune` done for {rel_path} (local-only, history kept){detail}"
 
 
 def check_retention(
@@ -595,8 +551,9 @@ def retention_warning(
     Checks ``retention.count`` (commit count) and, when ``oldest_ts`` is
     given, ``retention.age`` (e.g. ``30d`` parsed via :func:`parse_retention_age`).
     Never squashes (that would break plan.json hashes + remove history).
-    Returns combined warning string or None. History kept by default;
-    pruning is opt-in via ``commit --prune-retention`` / ``git lfs prune``.
+    Returns combined warning string or None. History kept; automatic
+    pruning was removed with LFS (``commit --prune-retention`` is
+    deprecated and warn-only).
     """
     if not isinstance(retention, dict):
         return None
@@ -605,8 +562,8 @@ def retention_warning(
     if isinstance(want, int) and want >= 1 and count > want:
         reasons.append(
             f"{count} commits exceed retention.count={want} "
-            "(history kept; prune with `git lfs prune` or "
-            "`git filter-repo` — see docs)"
+            "(history kept; no automatic pruning since LFS removal — "
+            "manual `git filter-repo` only, see docs)"
         )
     age_warn = retention_age_warning(oldest_ts, retention, now)
     if age_warn:

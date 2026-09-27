@@ -28,7 +28,7 @@ Venv-only installer: creates/uses a venv (default
 or --venv DIR) and installs versioneer into it (--dev = editable
 install). Never touches system python (no sudo pip, no
 --break-system-packages). Preflight requires python3 >= 3.12 and
-git; missing git-lfs is a warn-only. Installs bash/fish/zsh
+git. Installs bash/fish/zsh
 completions unless --no-completions. Always installs
 /usr/local/bin/versioneer + /usr/local/bin/vers shims (via sudo,
 warn-only if sudo fails — pass --no-system-shim to skip)
@@ -116,10 +116,7 @@ PYVER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_i
 echo "==> python3 $PYVER detected"
 python3 -c 'import sys; assert sys.version_info >= (3,12), "need >=3.12"' \
   || { echo "error: Python 3.12+ required (found $PYVER)" >&2; exit 1; }
-command -v git >/dev/null || { echo "error: git not found — sudo pacman -S git git-lfs" >&2; exit 1; }
-if ! command -v git-lfs >/dev/null; then
-  echo "warn: git-lfs not found — install with: sudo pacman -S git-lfs && git lfs install" >&2
-fi
+command -v git >/dev/null || { echo "error: git not found — sudo pacman -S git" >&2; exit 1; }
 
 # 3. Create venv if needed
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then

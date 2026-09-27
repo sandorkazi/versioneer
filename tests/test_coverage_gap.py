@@ -568,9 +568,8 @@ def test_daemon_helpers(tmp_path, monkeypatch):
         with mock.patch("subprocess.run", return_value=proc):
             ok4, _ = _daemon.try_reload_and_enable()
             assert ok4 is True
-    # prereq warnings both branches
-    with mock.patch("versioneer.core.store.lfs_available", return_value=False):
-        assert any("git-lfs" in w for w in _daemon.prereq_warnings())
+    # prereq warnings carry no LFS references anymore
+    assert all("lfs" not in w.lower() for w in _daemon.prereq_warnings())
     # is_linger yes/no/unknown
     with mock.patch("shutil.which", return_value="/bin/loginctl"):
         for out, want in [("yes\n", True), ("no\n", False), ("maybe\n", None)]:
@@ -1055,18 +1054,8 @@ def test_store_retention_helpers(tmp_path):
     assert _store.retention_warning(10, {"count": 5}) is not None
     assert _store.retention_warning(2, {"count": 5}) is None
     assert "retention" in _store.prune_guidance("a", {"count": 3}).lower()
-    with mock.patch("versioneer.core.store.lfs_available", return_value=False):
-        assert "git-lfs" in _store.prune_retention(tmp_path, "a", {})
-    with (
-        mock.patch("versioneer.core.store.lfs_available", return_value=True),
-        mock.patch("versioneer.core.store._run_git", side_effect=_store.GitError("x")),
-    ):
-        assert "history kept" in _store.prune_retention(tmp_path, "a", {})
-    with (
-        mock.patch("versioneer.core.store.lfs_available", return_value=True),
-        mock.patch("versioneer.core.store._run_git", return_value=""),
-    ):
-        assert "done" in _store.prune_retention(tmp_path, "a", {})
+    assert "git lfs" not in _store.prune_guidance("a", {"count": 3}).lower()
+    assert "filter=lfs" not in _store.prune_guidance("a", {"count": 3}).lower()
     assert _store.check_retention(tmp_path, "a", {}) == []
     assert _store.retention_age_warning(None, {"age": "30d"}) is None
     import time as _time

@@ -122,6 +122,21 @@ def plan_entry(target, meta_root: str, store: Path, dest: Path | None) -> dict:
             target.path, _mon.live_abs_path(target.path, target.abs_path, meta_root),
             getattr(target, "flex", "fixed"), meta_root)
         src = store / rel
+        if getattr(target, "remote", None):
+            # Remote target: fetch the latest blob into the cache and deploy
+            # from there (plan hash-guard semantics unchanged: a rotation
+            # between plan-out and deploy surfaces as an interim edit).
+            from versioneer.core import remote as _rem_p
+
+            rem = target.remote
+            try:
+                src = _rem_p.materialize_latest(
+                    rem.get("backend", "file"), rem.get("root", ""),
+                    rel.as_posix(), state_dir() / "remote-cache",
+                )
+            except _rem_p.RemoteError as e:
+                return {"target": target.path, "src_hash": "missing",
+                        "dst_hash": "", "action": f"error: remote unreachable ({e})"}
     sym = getattr(target, "symlink", "preserve")
     ign = list(getattr(target, "ignore", []) or [])
     if not _src_exists(src, kind, sym):
@@ -737,6 +752,20 @@ def deploy_one(target, config, store: Path, to_override: str = "",
     if kind == "manifest":
         return _deploy_manifest(target, config, store, src,
                                 dry_run=dry_run, apply_manifest=apply_manifest)
+
+    if getattr(target, "remote", None):
+        from versioneer.core import remote as _rem_o
+
+        rem = target.remote
+        try:
+            src = _rem_o.materialize_latest(
+                rem.get("backend", "file"), rem.get("root", ""), rel.as_posix(),
+                state_dir() / "remote-cache")
+        except _rem_o.RemoteError as e:
+            return {"target": target.path, "status": "error",
+                    "reason": f"remote unreachable: {e}",
+                    "action": "error", "src_hash": "missing",
+                    "dst_hash": _dst_hash(dest, kind, sym, ign)}
 
     if not _src_exists(src, kind, sym):
         # destination missing is a per-target error only when the *source*

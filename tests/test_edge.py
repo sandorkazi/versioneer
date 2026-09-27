@@ -1,4 +1,4 @@
-"""Edge/boundary coverage: mocks for git, lfs, stat, and CLI option paths."""
+"""Edge/boundary coverage: mocks for git, stat, and CLI option paths."""
 
 from __future__ import annotations
 
@@ -171,29 +171,6 @@ def test_store_git_error_paths(tmp_path):
             assert False
         except store_mod.GitError:
             pass
-
-
-def test_store_ensure_lfs_success_writes_attributes(tmp_path):
-    store = tmp_path / "store"
-    store.mkdir()
-    with mock.patch("shutil.which", return_value="/usr/bin/git-lfs"), mock.patch(
-        "versioneer.core.store._run_git", return_value=""
-    ):
-        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
-        text = (store / ".gitattributes").read_text()
-        assert "a.bin" in text and "*.bin" in text
-        # second call with same patterns: no duplicate crash
-        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
-
-
-def test_store_ensure_lfs_install_fails_warns(tmp_path):
-    store = tmp_path / "s"
-    store.mkdir()
-    with mock.patch("shutil.which", return_value="/usr/bin/git-lfs"), mock.patch(
-        "versioneer.core.store._run_git", side_effect=store_mod.GitError("lfs boom")
-    ):
-        warn = store_mod.ensure_lfs(store, ["a.bin"])
-        assert "lfs" in warn.lower()
 
 
 def test_permissions_uid_gid_fallback(tmp_path):

@@ -167,9 +167,16 @@ def check_once(config_name: str, host: str = "") -> dict:
                 r
                 for r in auto_results
                 if r["state"] not in ("missing", "read-error")
-                and _cfg.has_limited_retention(getattr(r["target"], "retention", {}))
+                and _cfg.retention_bounded(r["target"])
             ]
-            _auto_rels = {r["rel"].as_posix() for r in _valid_for_guard}
+            _auto_rels = set()
+            for r in _valid_for_guard:
+                _rel = r["rel"]
+                if getattr(r["target"], "remote", None):
+                    from versioneer.core import remote as _rem_g
+
+                    _rel = _rem_g.pointer_rel_for(_rel)
+                _auto_rels.add(_rel.as_posix())
             _internal = {_cfg.SNAPSHOT_NAME, ".gitattributes", ".versioneer-keep"}
             _blocking: list[str] = []
             for _s in _store.staged_files(store):
@@ -203,16 +210,68 @@ def check_once(config_name: str, host: str = "") -> dict:
             if r["state"] in ("missing", "read-error"):
                 out["errors"].append(f"{t.path}: {r['state']} — {r['detail']}")
                 continue
-            if not config.meta.auto_commit and not _cfg.has_limited_retention(
-                getattr(t, "retention", {})
-            ):
+            if not config.meta.auto_commit and not _cfg.retention_bounded(t):
                 out["errors"].append(
                     f"{t.path}: auto-commit skipped — "
-                    "requires limited retention (set retention.count >= 1)"
+                    "requires limited retention (set retention.count >= 1 "
+                    "or use a remote target)"
                 )
                 continue
             abs_path = r["abs_path"]
             rel = r["rel"]
+            if getattr(t, "remote", None):
+                # Remote target: push a blob + refresh the pointer. The
+                # daemon never prompts, so no sudo fallbacks here — a
+                # denied read is recorded as an error instead.
+                from versioneer.core import remote as _rem_d
+
+                rem = t.remote
+                try:
+                    _data = abs_path.read_bytes()
+                except OSError as e:
+                    out["errors"].append(f"{t.path}: remote read failed: {e}")
+                    continue
+                try:
+                    _hash = _mon.hash_target(
+                        abs_path, t.kind, t.symlink, list(t.ignore or [])
+                    )
+                except OSError as e:
+                    out["errors"].append(f"{t.path}: remote hash failed: {e}")
+                    continue
+                if _hash in ("missing", "read-error"):
+                    out["errors"].append(f"{t.path}: cannot hash for remote push")
+                    continue
+                try:
+                    _owner, _group, _mode = _perm.capture(
+                        abs_path, follow=(t.symlink == "follow")
+                    )
+                except OSError as e:
+                    out["errors"].append(f"{t.path}: stat failed: {e}")
+                    continue
+                try:
+                    _blob = _rem_d.push_blob(
+                        rem.get("backend", "file"), rem.get("root", ""),
+                        rel.as_posix(), _data, _hash,
+                    )
+                    _rem_d.prune_blobs(
+                        rem.get("backend", "file"), rem.get("root", ""),
+                        rel.as_posix(), _rem_d.remote_retention(rem),
+                    )
+                    _rem_d.write_pointer(
+                        store, _rem_d.pointer_rel_for(rel),
+                        _rem_d.pointer_payload(
+                            rem.get("backend", "file"), rem.get("root", ""),
+                            rel.as_posix(), _blob, _hash,
+                        ),
+                    )
+                except _rem_d.RemoteError as e:
+                    out["errors"].append(f"{t.path}: remote push failed: {e}")
+                    continue
+                t.owner, t.group, t.mode = _owner, _group, _mode
+                t.hash = _hash
+                rels.append(_rem_d.pointer_rel_for(rel).as_posix())
+                out["committed"].append(t.path)
+                continue
             dest = store / rel
             try:
                 from versioneer.cli import _stage_artifact as _stage
@@ -462,13 +521,8 @@ def is_linger_enabled() -> bool | None:
 
 
 def prereq_warnings() -> list[str]:
-    """Warn-only preflight: git-lfs (required) + sops/age (optional)."""
+    """Warn-only preflight: sops/age (optional)."""
     warnings: list[str] = []
-    if not _store.lfs_available():
-        warnings.append(
-            "git-lfs not found — install with: sudo pacman -S git-lfs "
-            "&& git lfs install (binary targets fall back to plain git)"
-        )
     try:
         from versioneer.core import secrets as _sec
 

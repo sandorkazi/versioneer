@@ -91,7 +91,7 @@ def test_target_add_binary_large_and_dangling_warn(tmp_path, monkeypatch):
     big = tmp_path / "big.bin"
     big.write_bytes(b"\x00" * 1024)  # binary detect via NUL
     r = runner.invoke(cli, ["-C", "b", "target", "add", str(big), "--kind", "binary"])
-    assert r.exit_code == 0, r.output  # warns about lfs if missing, still tracks
+    assert r.exit_code == 0, r.output  # tracks without warnings at this size
     c = cfg.load("b")
     assert c.targets[0].kind == "binary"
 

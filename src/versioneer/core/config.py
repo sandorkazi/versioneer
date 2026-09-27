@@ -94,8 +94,8 @@ def _valid_retention_age(age: object) -> bool:
 #: frequent silent commits could take up space quickly.
 AUTO_COMMIT_SPACE_WARNING = (
     "auto-commit enabled: frequent silent commits could take up space quickly "
-    "— keep retention.count limited (history kept; prune with "
-    "`git lfs prune` or `versioneer commit --prune-retention`)"
+    "— keep retention.count limited (history kept; no automatic pruning "
+    "since LFS removal)"
 )
 
 
@@ -110,6 +110,22 @@ def has_limited_retention(retention: object) -> bool:
         return False
     count = retention.get("count")
     return isinstance(count, int) and not isinstance(count, bool) and count >= 1
+
+
+def retention_bounded(target) -> bool:
+    """True when auto-commit space use is bounded for a target.
+
+    Git ``retention.count >= 1``, or a nonversioned remote (rotation to
+    keep-last-N is always enforced, defaulting to 3 when unset).
+    """
+    if has_limited_retention(getattr(target, "retention", {}) or {}):
+        return True
+    remote = getattr(target, "remote", None) or {}
+    if not remote:
+        return False
+    from versioneer.core import remote as _rem
+
+    return _rem.remote_retention(remote) >= 1
 
 
 @dataclass
@@ -147,6 +163,10 @@ class Target:
     # matching this glob are candidates for `watch --auto-add` / bulk add.
     # "" = disabled. Accepts True ("*") / False ("") for legacy bools.
     auto_add_glob: str = ""
+    # Nonversioned remote ([targets.remote] in TOML): {backend, root, retention}.
+    # Content revisions live on the remote with keep-last-N rotation; git
+    # holds only a pointer file. Empty dict = git-tracked (default).
+    remote: dict = field(default_factory=dict)
 
     def validate(self, meta_root: str = "") -> list[str]:
         errors: list[str] = []
@@ -180,12 +200,23 @@ class Target:
                     errors.append(f"invalid manifest.type {mtype!r}: packages|wine|systemd|env")
         if self.auto_add_glob is not None and not isinstance(self.auto_add_glob, str):
             errors.append(f"invalid auto_add_glob {self.auto_add_glob!r}: must be a glob string")
-        if self.auto_commit:
-            if not has_limited_retention(self.retention):
+        if self.auto_commit and not retention_bounded(self):
+            errors.append(
+                "auto_commit=true requires limited retention "
+                "(set retention.count >= 1, e.g. --retention-count N, "
+                "or use a remote target with --remote-retention N)"
+            )
+        if self.remote:
+            from versioneer.core import remote as _rem
+
+            errors.extend(_rem.validate_remote_dict(self.remote))
+            if self.kind not in ("text", "binary"):
                 errors.append(
-                    "auto_commit=true requires limited retention "
-                    "(set retention.count >= 1, e.g. --retention-count N)"
+                    f"remote targets must be kind text|binary, got {self.kind!r} "
+                    "(dir/manifest remotes are not supported in v1)"
                 )
+            if self.encrypt:
+                errors.append("remote + encrypt=true is not supported in v1")
         return errors
 
     def to_dict(self) -> dict:
@@ -212,6 +243,7 @@ class Target:
             "manifest": dict(self.manifest),
             "auto_add_glob": self.auto_add_glob,
             "auto_commit": self.auto_commit,
+            "remote": dict(self.remote),
         }
 
     @classmethod
@@ -242,6 +274,8 @@ class Target:
             auto_add_glob = ""
         else:
             auto_add_glob = str(raw_glob)
+        raw_remote = data.get("remote", {})
+        remote = dict(raw_remote) if isinstance(raw_remote, dict) else {}
         return cls(
             path=data.get("path", ""),
             abs_path=data.get("abs_path", ""),
@@ -265,6 +299,7 @@ class Target:
             manifest=manifest,
             auto_add_glob=auto_add_glob,
             auto_commit=bool(data.get("auto_commit", False)),
+            remote=remote,
         )
 
 
@@ -313,11 +348,13 @@ def _payload_for(config: Config) -> dict:
     targets_payload = []
     for t in config.targets:
         d = t.to_dict() if isinstance(t, Target) else dict(t)  # type: ignore[union-attr]
-        # Omit empty manifest subtables: tomli_w renders {} as an empty
-        # [targets.manifest] block on every target, which is noisy and
-        # drifts from the docs (subtable only for kind="manifest").
+        # Omit empty manifest/remote subtables: tomli_w renders {} as an empty
+        # [targets.manifest] / [targets.remote] block on every target, which
+        # is noisy and drifts from the docs (subtable only when configured).
         if not d.get("manifest"):
             d.pop("manifest", None)
+        if not d.get("remote"):
+            d.pop("remote", None)
         targets_payload.append(d)
     return {
         "meta": {

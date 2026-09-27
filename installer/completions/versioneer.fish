@@ -20,11 +20,11 @@ for prog in versioneer vers
   complete -c $prog -f -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from create' -l notify
   complete -c $prog -f -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from create' -l no-notify
   # target add
-  for flag in root kind flex interest glob auto-add-glob ignore symlink machines retention retention-count retention-age template no-template on-deploy deploy-path check-interval encrypt no-encrypt auto-commit no-auto-commit force
+  for flag in root kind flex interest glob auto-add-glob ignore symlink machines retention retention-count retention-age template no-template on-deploy deploy-path check-interval encrypt no-encrypt auto-commit no-auto-commit force remote-root remote-backend remote-retention
     complete -c $prog -f -n '__fish_seen_subcommand_from target; and __fish_seen_subcommand_from add' -l $flag
   end
   # target set (toggle autocommittability / retention on tracked files)
-  for flag in auto-commit no-auto-commit retention retention-count retention-age clear-retention
+  for flag in auto-commit no-auto-commit retention retention-count retention-age clear-retention remote-root remote-retention clear-remote
     complete -c $prog -f -n '__fish_seen_subcommand_from target; and __fish_seen_subcommand_from set' -l $flag
   end
   # service

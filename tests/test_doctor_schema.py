@@ -2,7 +2,6 @@
 
 - unreachable upstream warns (ls-remote, timeout, warn-only) not crash
 - [targets.manifest] subtable read/write compat
-- ensure_lfs exact-line match + idempotent
 - auto_add_glob persists (+ interest=diff v1 state-deploy documented)
 """
 
@@ -15,7 +14,6 @@ from click.testing import CliRunner
 
 from versioneer.cli import cli
 from versioneer.core import config as cfg
-from versioneer.core import store as store_mod
 
 
 def _make_config(runner: CliRunner, tmp_path: Path, name: str, upstream: str) -> Path:
@@ -111,29 +109,19 @@ def test_manifest_flat_compat(tmp_path, monkeypatch):
     assert t2.manifest.get("type") == "packages"
 
 
-def test_ensure_lfs_exact_line_and_idempotent(tmp_path):
-    store = tmp_path / "store"
-    store.mkdir()
-    with (
-        mock.patch("shutil.which", return_value="/usr/bin/git-lfs"),
-        mock.patch("versioneer.core.store._run_git", return_value=""),
-    ):
-        # Substring trap: "xa.bin ..." must NOT satisfy "a.bin".
-        (store / ".gitattributes").write_text(
-            "xa.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8"
-        )
-        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
-        text = (store / ".gitattributes").read_text(encoding="utf-8")
-        assert "a.bin filter=lfs" in text
-        assert text.count("a.bin filter=lfs") >= 1
-        # Exact entry for a.bin present exactly once; *.bin once.
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        assert lines.count("a.bin filter=lfs diff=lfs merge=lfs -text") == 1
-        assert lines.count("*.bin filter=lfs diff=lfs merge=lfs -text") == 1
-        # Second call: idempotent, no duplicates.
-        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
-        text2 = (store / ".gitattributes").read_text(encoding="utf-8")
-        assert text2 == text
+def test_no_lfs_attributes_created_by_tracking(tmp_path, monkeypatch):
+    # LFS was removed: tracking a binary must not create .gitattributes rules.
+    monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
+    runner = CliRunner()
+    store = _make_config(runner, tmp_path, "plain", "git@example:plain.git")
+    assert not (store / ".gitattributes").exists()
+    b = tmp_path / "b.bin"
+    b.write_bytes(b"\x00" * 64)
+    r = runner.invoke(cli, ["-C", "plain", "target", "add", str(b), "--kind", "binary"])
+    assert r.exit_code == 0, r.output
+    assert "git lfs" not in r.output.lower()
+    assert "filter=lfs" not in r.output.lower()
+    assert not (store / ".gitattributes").exists()
 
 
 def test_auto_add_glob_persists(tmp_path, monkeypatch):

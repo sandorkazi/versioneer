@@ -22,8 +22,8 @@ _versioneer() {
         target)
           _describe 'target subcommand' target_sub
           case ${words[3]} in
-            add) _arguments '--root[root]:' '--kind[kind]:(text binary dir auto)' '--flex[flex]:(fixed user flexi auto)' '--interest[interest]:(state diff)' '--glob[glob]:' '--auto-add-glob[glob]:' '--ignore[pattern]:' '--symlink[symlink]:(preserve follow)' '--machines[hosts]:' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--template' '--no-template' '--on-deploy[cmd]:' '--deploy-path[path]:' '--check-interval[interval]:' '--encrypt' '--no-encrypt' '--auto-commit' '--no-auto-commit' '--force' ;;
-            set) _arguments '--auto-commit' '--no-auto-commit' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--clear-retention' ;;
+            add) _arguments '--root[root]:' '--kind[kind]:(text binary dir auto)' '--flex[flex]:(fixed user flexi auto)' '--interest[interest]:(state diff)' '--glob[glob]:' '--auto-add-glob[glob]:' '--ignore[pattern]:' '--symlink[symlink]:(preserve follow)' '--machines[hosts]:' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--template' '--no-template' '--on-deploy[cmd]:' '--deploy-path[path]:' '--check-interval[interval]:' '--encrypt' '--no-encrypt' '--auto-commit' '--no-auto-commit' '--force' '--remote-root[path]:' '--remote-backend[backend]:' '--remote-retention[n]:' ;;
+            set) _arguments '--auto-commit' '--no-auto-commit' '--retention[count]:' '--retention-count[count]:' '--retention-age[age]:' '--clear-retention' '--remote-root[path]:' '--remote-retention[n]:' '--clear-remote' ;;
           esac ;;
         service)
           _describe 'service subcommand' service_sub

@@ -1,4 +1,4 @@
-"""Phase 2: storage (git+LFS) + review (status/diff/log) + save (commit/push/pull)."""
+"""Phase 2: storage (plain git) + review (status/diff/log) + save (commit/push/pull)."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def test_binary_diff_and_retention_warn(tmp_path, monkeypatch):
     b.write_bytes(b"\x00" * 64)
     r = runner.invoke(cli, ["-C", "bin", "target", "add", str(b), "--kind", "binary",
                             "--retention-count", "1"])
-    assert r.exit_code == 0 and "git-lfs" in r.output  # warn-only without LFS binary
+    assert r.exit_code == 0 and "tracking" in r.output
     b.write_bytes(b"\x00" * 128)
     assert "binary" in runner.invoke(cli, ["-C", "bin", "diff"]).output
     r = runner.invoke(cli, ["-C", "bin", "commit", str(b), "-m", "b2"])
@@ -185,14 +185,10 @@ def test_store_clone_and_upstream_helpers(tmp_path):
         assert "not empty" in str(e)
 
 
-def test_lfs_attributes_written_when_present(tmp_path, monkeypatch):
-    store = tmp_path / "s"
-    store.mkdir()
-    with mock.patch("shutil.which", return_value="/usr/bin/git-lfs"), mock.patch(
-        "versioneer.core.store._run_git", return_value=""
-    ):
-        assert store_mod.ensure_lfs(store, ["a.bin"]) is None
-        assert "a.bin" in (store / ".gitattributes").read_text()
-    assert store_mod.lfs_available() in (True, False)
+def test_no_lfs_helpers_remain():
+    # LFS was removed: no tracking setup, no availability probe, no prune runner.
+    assert not hasattr(store_mod, "ensure_lfs")
+    assert not hasattr(store_mod, "lfs_available")
+    assert not hasattr(store_mod, "prune_retention")
     assert store_mod.retention_warning(5, {"count": 3}) is not None
     assert store_mod.retention_warning(2, {"count": 3}) is None
