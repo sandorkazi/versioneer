@@ -20,7 +20,9 @@ WINE_DEFAULT_IGNORES = [
 
 
 def expand_path(raw: str) -> Path:
-    return Path(os.path.expandvars(raw)).expanduser()
+    from versioneer.core import elevate as _elev
+
+    return _elev.expand_user(raw)
 
 
 def _abs_preserve(p: Path) -> Path:
@@ -63,12 +65,27 @@ def resolve_input(raw: str, root: str = "") -> tuple[str, Path]:
         base = Path.cwd() / p
         abs_path = _abs_preserve(base)
     else:
-        abs_path = _abs_preserve(p) if (p.exists() or p.is_symlink()) else p.absolute()
+        # NOTE: Path.exists() is False for permission-denied paths too,
+        # which used to mis-resolve root-owned files to p.absolute().
+        # Treat lstat-denied as existing so elevated reads still target
+        # the right absolute path.
+        try:
+            os.lstat(p)
+            _exists = True
+        except OSError:
+            _exists = False
+            try:
+                _exists = bool(p.is_symlink())
+            except OSError:
+                _exists = False
+        abs_path = _abs_preserve(p) if _exists else p.absolute()
     return str(abs_path), abs_path
 
 
 def detect_flex(abs_path: Path) -> str:
-    home = Path.home()
+    from versioneer.core import elevate as _elev
+
+    home = _elev.effective_home()
     try:
         abs_path.relative_to(home)
         return "user"
@@ -146,9 +163,16 @@ def iter_dir_files(top: Path, ignore: list[str]) -> list[Path]:
             rel_dir = base.relative_to(top).as_posix()
         except ValueError:
             continue
+        # Never descend into an embedded .git: copying/hashing it turns the
+        # store artifact into a gitlink (mode 160000, perpetual
+        # "modified content" dirt) instead of versioned files.
+        if ".git" in dirnames:
+            dirnames.remove(".git")
         # prune ignored dirs in-place
         kept: list[str] = []
         for d in sorted(dirnames):
+            if d == ".git":
+                continue
             rel = f"{rel_dir}/{d}" if rel_dir != "." else d
             if matches_ignore(rel + "/", ignore) or matches_ignore(rel, ignore):
                 continue
@@ -156,6 +180,10 @@ def iter_dir_files(top: Path, ignore: list[str]) -> list[Path]:
         dirnames[:] = kept
         for fn in sorted(filenames):
             rel = f"{rel_dir}/{fn}" if rel_dir != "." else fn
+            # Skip files inside an embedded .git (defensive; dirnames prune
+            # above normally prevents reaching them).
+            if rel == ".git" or rel.startswith(".git/"):
+                continue
             if matches_ignore(rel, ignore):
                 continue
             out.append(base / fn)
@@ -226,7 +254,9 @@ def artifact_rel(store_path: str, abs_path: Path, flex: str, root: str = "") -> 
     """Store-relative artifact path for a target."""
     if root:
         return Path(store_path)
-    home = Path.home()
+    from versioneer.core import elevate as _elev
+
+    home = _elev.effective_home()
     if flex == "user":
         try:
             return abs_path.relative_to(home)
@@ -239,26 +269,60 @@ def artifact_rel(store_path: str, abs_path: Path, flex: str, root: str = "") -> 
     return Path(s) if s else Path("_root")
 
 
+def _dir_is_prefix_root(d: Path) -> bool:
+    """True when directory listing itself looks like a wine prefix root."""
+    try:
+        if not d.is_dir():
+            return False
+        try:
+            names = {p.name for p in d.iterdir()}
+        except OSError:
+            return False
+        if "drive_c" in names:
+            return True
+        # Prefix without drive_c yet (rare): require both registry + dosdevices.
+        if "system.reg" in names and "dosdevices" in names:
+            return True
+        return False
+    except OSError:
+        return False
+
+
 def is_wine_prefix(abs_path: Path) -> bool:
-    """True when a path looks like (or lives inside) a wine prefix."""
+    """True only when the path itself is a wine prefix root (not a subdir).
+
+    Previous heuristic also matched any path containing the substring
+    "wine"/"pfx" plus any dir living inside a prefix, which falsely
+    refused savegame folders like <prefix>/drive_c/.../SavedGames/Slot1.
+    The full-prefix --force gate must only trigger on the root itself;
+    use is_inside_wine_prefix() for the broader preset-ignore case.
+    """
     try:
         probe = abs_path if abs_path.is_dir() else abs_path.parent
-        if probe.is_dir():
-            try:
-                names = {p.name for p in probe.iterdir()}
-            except OSError:
-                names = set()
-            if "drive_c" in names:
+        return _dir_is_prefix_root(probe)
+    except OSError:
+        return False
+
+
+def is_inside_wine_prefix(abs_path: Path, max_depth: int = 12) -> bool:
+    """True when path is a prefix root or lives under one (ancestor has drive_c)."""
+    try:
+        cur = abs_path if abs_path.is_dir() else abs_path.parent
+        for _ in range(max_depth):
+            if _dir_is_prefix_root(cur):
                 return True
-        low = abs_path.as_posix().lower()
-        return "wine" in low or "pfx" in low
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+        return False
     except OSError:
         return False
 
 
 def wine_preset_ignores(abs_path: Path, ignore: list[str]) -> list[str]:
     out = list(ignore)
-    if is_wine_prefix(abs_path):
+    if is_wine_prefix(abs_path) or is_inside_wine_prefix(abs_path):
         for pat in WINE_DEFAULT_IGNORES:
             if pat not in out:
                 out.append(pat)

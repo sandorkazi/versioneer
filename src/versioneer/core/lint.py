@@ -57,7 +57,9 @@ def hardcoded_path_warnings(path: Path) -> list[str]:
     homes = set(_HARDCODED_HOME.findall(text))
     if not homes:
         return []
-    current = Path.home().name
+    from versioneer.core import elevate as _elev
+
+    current = _elev.effective_home().name
     others = sorted(h for h in homes if h != current)
     if not others:
         return []

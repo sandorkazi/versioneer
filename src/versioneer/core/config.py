@@ -24,8 +24,13 @@ def config_dir() -> Path:
     if override:
         return Path(override).expanduser()
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-    return base / "versioneer"
+    if xdg:
+        return Path(os.path.expandvars(xdg)).expanduser() / "versioneer"
+    # Sudo-aware: `sudo vers ...` must read the invoking user's configs,
+    # not /root/.config/versioneer.
+    from versioneer.core import elevate as _elev
+
+    return _elev.effective_home() / ".config" / "versioneer"
 
 
 def config_path(name: str) -> Path:
@@ -85,6 +90,28 @@ def _valid_retention_age(age: object) -> bool:
     return bool(m) and int(m.group(1)) >= 1
 
 
+#: Warning shown whenever per-target auto-commit is enabled or fires:
+#: frequent silent commits could take up space quickly.
+AUTO_COMMIT_SPACE_WARNING = (
+    "auto-commit enabled: frequent silent commits could take up space quickly "
+    "— keep retention.count limited (history kept; prune with "
+    "`git lfs prune` or `versioneer commit --prune-retention`)"
+)
+
+
+def has_limited_retention(retention: object) -> bool:
+    """True when retention limits kept revisions (count >= 1).
+
+    Per-target ``auto_commit`` is only available with limited retention.
+    An age-only retention does not bound revision count, so it alone
+    is not sufficient.
+    """
+    if not isinstance(retention, dict):
+        return False
+    count = retention.get("count")
+    return isinstance(count, int) and not isinstance(count, bool) and count >= 1
+
+
 @dataclass
 class Target:
     path: str = ""
@@ -109,6 +136,10 @@ class Target:
     template: bool = False
     on_deploy: str = ""
     encrypt: bool = False
+    # Per-target auto-commit opt-in (daemon commits drift silently).
+    # Only available with limited retention (retention.count >= 1) since
+    # frequent auto-commits could take up space quickly.
+    auto_commit: bool = False
     # Manifest subtable ([targets.manifest] in TOML): only for kind="manifest".
     # {type: packages|wine|systemd|env, source: builtin id/cmd, output: fname}.
     manifest: dict = field(default_factory=dict)
@@ -149,6 +180,12 @@ class Target:
                     errors.append(f"invalid manifest.type {mtype!r}: packages|wine|systemd|env")
         if self.auto_add_glob is not None and not isinstance(self.auto_add_glob, str):
             errors.append(f"invalid auto_add_glob {self.auto_add_glob!r}: must be a glob string")
+        if self.auto_commit:
+            if not has_limited_retention(self.retention):
+                errors.append(
+                    "auto_commit=true requires limited retention "
+                    "(set retention.count >= 1, e.g. --retention-count N)"
+                )
         return errors
 
     def to_dict(self) -> dict:
@@ -174,6 +211,7 @@ class Target:
             "encrypt": self.encrypt,
             "manifest": dict(self.manifest),
             "auto_add_glob": self.auto_add_glob,
+            "auto_commit": self.auto_commit,
         }
 
     @classmethod
@@ -226,6 +264,7 @@ class Target:
             encrypt=bool(data.get("encrypt", False)),
             manifest=manifest,
             auto_add_glob=auto_add_glob,
+            auto_commit=bool(data.get("auto_commit", False)),
         )
 
 
@@ -328,6 +367,12 @@ def export_snapshot(config: Config, store: Path) -> Path:
     path = snapshot_path(store)
     with path.open("wb") as f:
         tomli_w.dump(_payload_for(config), f)
+    try:
+        from versioneer.core import elevate as _elev
+
+        _elev.fix_store_after_write(store, [SNAPSHOT_NAME])
+    except (OSError, ImportError):
+        pass
     return path
 
 
@@ -359,6 +404,13 @@ def save(config: Config) -> Path:
     payload = _payload_for(config)
     with path.open("wb") as f:
         tomli_w.dump(payload, f)
+    try:
+        from versioneer.core import elevate as _elev
+
+        _elev.fix_ownership(d, recursive=False)
+        _elev.fix_ownership(path, recursive=False)
+    except (OSError, ImportError):
+        pass
     return path
 
 
@@ -373,7 +425,11 @@ def store_dir(config: Config) -> Path:
     import os as _os
 
     raw = config.meta.storage or f"~/versioneer-store/{config.meta.name}"
-    return Path(_os.path.expandvars(raw)).expanduser()
+    # Sudo-aware ~ expansion: bare ~/... follows the invoking user,
+    # not /root, so `sudo vers` uses the user's stores.
+    from versioneer.core import elevate as _elev
+
+    return _elev.expand_user(_os.path.expandvars(raw))
 
 
 def find_target(config: Config, key: str) -> Target | None:

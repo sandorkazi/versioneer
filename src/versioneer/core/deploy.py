@@ -33,10 +33,13 @@ from versioneer.core import template as _tmpl
 def state_dir() -> Path:
     override = os.environ.get("VERSIONEER_STATE_DIR")
     if override:
-        return Path(override).expanduser()
+        return Path(os.path.expandvars(override)).expanduser()
     xdg = os.environ.get("XDG_STATE_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
-    return base / "versioneer"
+    if xdg:
+        return Path(os.path.expandvars(xdg)).expanduser() / "versioneer"
+    from versioneer.core import elevate as _elev
+
+    return _elev.effective_home() / ".local" / "state" / "versioneer"
 
 
 def _now_tag() -> str:
@@ -90,7 +93,9 @@ def live_dest(target, meta_root: str = "", to_override: str = "",
     if flex == "user":
         abs_p = _mon.live_abs_path(target.path, target.abs_path, "")
         rel = _mon.store_rel_for(target.path, abs_p, flex, "")
-        return Path.home() / rel
+        from versioneer.core import elevate as _elev
+
+        return _elev.effective_home() / rel
     return _mon.live_abs_path(target.path, target.abs_path, "")
 
 

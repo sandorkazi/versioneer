@@ -57,7 +57,9 @@ def gen_packages() -> tuple[str, str, str]:
 
 def gen_wine() -> tuple[str, str, str]:
     wine_version = _run(["wine", "--version"]) if shutil.which("wine") else "(wine not found)"
-    prefix = os.environ.get("WINEPREFIX", str(Path.home() / ".wine"))
+    from versioneer.core import elevate as _elev
+
+    prefix = os.environ.get("WINEPREFIX", str(_elev.effective_home() / ".wine"))
     arch = os.environ.get("WINEARCH", "")
     tricks = _run(["winetricks", "list-installed"]) if shutil.which("winetricks") else ""
     exes: list[str] = []

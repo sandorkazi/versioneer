@@ -56,16 +56,26 @@ def is_repo(store: Path) -> bool:
 
 def ensure_repo(store: Path) -> None:
     store.mkdir(parents=True, exist_ok=True)
-    if not is_repo(store):
-        _run_git(["init"], store)
-    # local identity fallback so commits work in tests/fresh machines
     try:
-        email = _run_git(["config", "user.email"], store)
-    except GitError:
-        email = ""
-    if not email:
-        _run_git(["config", "user.email", "versioneer@localhost"], store)
-        _run_git(["config", "user.name", "versioneer"], store)
+        if not is_repo(store):
+            _run_git(["init"], store)
+        # local identity fallback so commits work in tests/fresh machines
+        try:
+            email = _run_git(["config", "user.email"], store)
+        except GitError:
+            email = ""
+        if not email:
+            _run_git(["config", "user.email", "versioneer@localhost"], store)
+            _run_git(["config", "user.name", "versioneer"], store)
+    finally:
+        # Transparent sudo: a root-via-sudo run must leave the user's
+        # store usable by the user (no root-owned .git/index).
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store)
+        except (OSError, ImportError):
+            pass
 
 
 def ensure_lfs(store: Path, rel_paths: list[str]) -> str | None:
@@ -105,6 +115,12 @@ def ensure_lfs(store: Path, rel_paths: list[str]) -> str | None:
             changed = True
     if changed:
         ga.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    try:
+        from versioneer.core import elevate as _elev
+
+        _elev.fix_store_after_write(store, rel_paths)
+    except (OSError, ImportError):
+        pass
     return None
 
 
@@ -156,29 +172,92 @@ def upstream_reachable(store: Path, url: str = "", timeout: int = 10) -> tuple[b
     return False, f"upstream unreachable: {first} (warn-only, offline?)"
 
 
+def _has_staged_changes(store: Path) -> bool:
+    """True when the index has staged changes vs HEAD.
+
+    Uses ``git diff --cached --quiet`` (staged-only) so unrelated worktree
+    dirt — e.g. a dirty gitlink (``modified content``) from an embedded
+    ``.git`` inside a tracked dir, or an untracked ``.gitattributes`` — never
+    triggers an empty commit attempt. ``git status --porcelain`` is global
+    and must not be used for this decision.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=store,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return True  # let the caller surface "git not found"
+    except OSError:
+        return True
+    return proc.returncode != 0
+
+
+def staged_files(store: Path) -> list[str]:
+    """Staged paths (vs HEAD) as posix rels; [] on non-repo/error.
+
+    Used by the per-target auto-commit guard: a silent auto-commit must
+    never sweep in pre-existing staged changes belonging to
+    non-autocommittable targets (messed-up state: files staged but never
+    committed explicitly). Only staged changes matter — ``git commit``
+    without ``-a`` commits the index, so unstaged worktree dirt and
+    untracked files are safe and ignored here.
+    """
+    if not is_repo(store):
+        return []
+    try:
+        out = _run_git(["diff", "--cached", "--name-only"], store)
+    except GitError:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
 def add_and_commit(store: Path, rel_paths: list[str], message: str) -> str | None:
     ensure_repo(store)
-    if rel_paths:
-        _run_git(["add", "--", *rel_paths], store)
-    else:
-        _run_git(["add", "-A"], store)
-    status = _run_git(["status", "--porcelain"], store)
-    if not status:
-        return None
-    _run_git(["commit", "-m", message], store)
-    return _run_git(["rev-parse", "HEAD"], store)
+    try:
+        if rel_paths:
+            _run_git(["add", "--", *rel_paths], store)
+        else:
+            _run_git(["add", "-A"], store)
+        if not _has_staged_changes(store):
+            return None
+        try:
+            _run_git(["commit", "-m", message], store)
+        except GitError as e:
+            # Defensive: a concurrent change can still leave nothing staged.
+            low = str(e).lower()
+            if "nothing to commit" in low or "no changes added to commit" in low:
+                return None
+            raise
+        return _run_git(["rev-parse", "HEAD"], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store, rel_paths)
+        except (OSError, ImportError):
+            pass
 
 
 def rm_and_commit(store: Path, rel_paths: list[str], message: str) -> str | None:
     ensure_repo(store)
-    if rel_paths:
-        # --cached-safe: artifact lives only in store, so plain rm is right
-        _run_git(["rm", "-r", "--", *rel_paths], store)
-    status = _run_git(["status", "--porcelain"], store)
-    if not status:
-        return None
-    _run_git(["commit", "-m", message], store)
-    return _run_git(["rev-parse", "HEAD"], store)
+    try:
+        if rel_paths:
+            # --cached-safe: artifact lives only in store, so plain rm is right
+            _run_git(["rm", "-r", "--", *rel_paths], store)
+        status = _run_git(["status", "--porcelain"], store)
+        if not status:
+            return None
+        _run_git(["commit", "-m", message], store)
+        return _run_git(["rev-parse", "HEAD"], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store, rel_paths)
+        except (OSError, ImportError):
+            pass
 
 
 def log_lines(store: Path, n: int = 10, rel_path: str = "") -> list[str]:
@@ -216,18 +295,44 @@ def get_upstream(store: Path) -> str:
 def set_upstream(store: Path, url: str) -> None:
     """Add or update origin without network access (offline-safe)."""
     ensure_repo(store)
-    if not url:
-        return
     try:
-        current = get_upstream(store)
-    except GitError:
-        current = ""
-    if current == url:
-        return
-    if current:
-        _run_git(["remote", "set-url", "origin", url], store)
-    else:
-        _run_git(["remote", "add", "origin", url], store)
+        if not url:
+            return
+        try:
+            current = get_upstream(store)
+        except GitError:
+            current = ""
+        if current == url:
+            return
+        if current:
+            _run_git(["remote", "set-url", "origin", url], store)
+        else:
+            _run_git(["remote", "add", "origin", url], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store)
+        except (OSError, ImportError):
+            pass
+
+
+def remove_upstream(store: Path) -> bool:
+    """Remove the origin remote (go local-only). Returns True when removed."""
+    if not is_repo(store):
+        return False
+    if not get_upstream(store):
+        return False
+    try:
+        _run_git(["remote", "remove", "origin"], store)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_store_after_write(store)
+        except (OSError, ImportError):
+            pass
+    return True
 
 
 def _offline_wrap(action: str, err: GitError) -> GitError:
@@ -307,7 +412,15 @@ def clone(url: str, dest: Path) -> None:
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or e.stdout or "").strip() or "git clone failed"
         raise GitError(f"offline — clone deferred (upstream unreachable): {detail}") from e
-    ensure_repo(dest)
+    try:
+        ensure_repo(dest)
+    finally:
+        try:
+            from versioneer.core import elevate as _elev
+
+            _elev.fix_ownership(dest, recursive=True)
+        except (OSError, ImportError):
+            pass
 
 
 def show_head_file(store: Path, rel_path: str) -> bytes | None:

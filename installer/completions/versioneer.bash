@@ -1,4 +1,4 @@
-# bash completion for versioneer (full flags/subcommands).
+# bash completion for versioneer / vers (full flags/subcommands).
 # Enable: source installer/completions/versioneer.bash
 _versioneer_complete() {
   local cur prev words cword
@@ -7,9 +7,9 @@ _versioneer_complete() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   words=("${COMP_WORDS[@]}")
 
-  local top="config target status diff log commit push pull deploy service bootstrap watch manifest doctor uninstall"
+  local top="init config target status diff log commit push pull deploy service bootstrap watch manifest doctor uninstall"
   local config_sub="create list show remove"
-  local target_sub="add list remove"
+  local target_sub="add list remove set"
   local service_sub="install enable disable check run"
 
   # third word on: versioneer <cmd> <sub> ...
@@ -30,7 +30,8 @@ _versioneer_complete() {
           return 0
         fi
         case "${words[2]}" in
-          add) COMPREPLY=($(compgen -W "--root --kind --flex --interest --glob --auto-add-glob --ignore --symlink --machines --retention --retention-count --retention-age --template --no-template --on-deploy --deploy-path --check-interval --encrypt --no-encrypt --force -h --help" -- "$cur")); return 0 ;;
+          add) COMPREPLY=($(compgen -W "--root --kind --flex --interest --glob --auto-add-glob --ignore --symlink --machines --retention --retention-count --retention-age --template --no-template --on-deploy --deploy-path --check-interval --encrypt --no-encrypt --auto-commit --no-auto-commit --force -h --help" -- "$cur")); return 0 ;;
+          set) COMPREPLY=($(compgen -W "--auto-commit --no-auto-commit --retention --retention-count --retention-age --clear-retention -h --help" -- "$cur")); return 0 ;;
         esac
         ;;
       service)
@@ -62,4 +63,4 @@ _versioneer_complete() {
     COMPREPLY=($(compgen -W "$top" -- "$cur"))
   fi
 }
-complete -F _versioneer_complete versioneer
+complete -F _versioneer_complete versioneer vers

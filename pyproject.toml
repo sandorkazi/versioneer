@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 versioneer = "versioneer.cli:cli"
+vers = "versioneer.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
