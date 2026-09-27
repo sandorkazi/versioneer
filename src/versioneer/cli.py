@@ -69,8 +69,6 @@ def _create_config_files(meta, store_path: str):
     try:
         _store.ensure_repo(store)
         _store.set_upstream(store, upstream)
-        # LFS install is warn-only: plain git keeps working without it.
-        lfs_warn = _store.ensure_lfs(store, ["*.bin"])
         # initial commit so push/pull/log have a HEAD (offline-safe, no push here).
         if not _store.log_lines(store, 1):
             readme = store / ".versioneer-keep"
@@ -84,7 +82,7 @@ def _create_config_files(meta, store_path: str):
         raise click.ClickException(str(e))
 
     saved = cfg.save(cfg.Config(meta=meta))
-    return saved, store, lfs_warn
+    return saved, store
 
 
 @cli.command("init")
@@ -101,11 +99,8 @@ def init_cmd(upstream: str | None) -> None:
         upstream=upstream,
         storage=DEFAULT_STORE_PATH,
     )
-    saved, store, lfs_warn = _create_config_files(meta, DEFAULT_STORE_PATH)
-    msg = f"[green]created[/green] {saved} + store {store}"
-    if lfs_warn:
-        console.print(f"[yellow]warn[/yellow]: {lfs_warn}")
-    console.print(msg)
+    saved, store = _create_config_files(meta, DEFAULT_STORE_PATH)
+    console.print(f"[green]created[/green] {saved} + store {store}")
 
 
 # ---------- config management (implemented) ----------
@@ -135,11 +130,8 @@ def config_create(name, store_path, upstream, auto_commit, auto_push, check_inte
         auto_push=auto_push,
         check_interval=check_interval,
     )
-    saved, store, lfs_warn = _create_config_files(meta, store_path)
-    msg = f"[green]created[/green] {saved} + store {store}"
-    if lfs_warn:
-        console.print(f"[yellow]warn[/yellow]: {lfs_warn}")
-    console.print(msg)
+    saved, store = _create_config_files(meta, store_path)
+    console.print(f"[green]created[/green] {saved} + store {store}")
 
 
 @config_grp.command("list")
@@ -338,6 +330,39 @@ def _stage_artifact(abs_path: Path, kind: str, symlink: str, ignore: list[str], 
         _shutil.copy2(abs_path, dest)
 
 
+def _push_remote_revision(
+    store: Path, target, rel_posix: str, data: bytes, content_hash: str
+) -> tuple[str, list[str]]:
+    """Push a blob, rotate to keep-last-N, refresh the git pointer.
+
+    Shared by add/commit/set. Returns (blob name, pruned names). Caller
+    refreshes TOML baselines and commits the pointer. Raises
+    click.ClickException on remote errors.
+    """
+    from versioneer.core import remote as _rem_h
+
+    rem = getattr(target, "remote", None) or {}
+    try:
+        blob = _rem_h.push_blob(
+            rem.get("backend", "file"), rem.get("root", ""),
+            rel_posix, data, content_hash,
+        )
+        pruned = _rem_h.prune_blobs(
+            rem.get("backend", "file"), rem.get("root", ""),
+            rel_posix, _rem_h.remote_retention(rem), exclude=blob,
+        )
+        _rem_h.write_pointer(
+            store, _rem_h.pointer_rel_for(Path(rel_posix)),
+            _rem_h.pointer_payload(
+                rem.get("backend", "file"), rem.get("root", ""),
+                rel_posix, blob, content_hash,
+            ),
+        )
+    except _rem_h.RemoteError as e:
+        raise click.ClickException(str(e))
+    return blob, pruned
+
+
 # ---------- stubs (explicit, non-zero exit) ----------
 
 
@@ -425,6 +450,25 @@ def target_grp(ctx):
     default=False,
     help="Allow tracking a whole wine prefix dir (escape hatch; manifest-only is default).",
 )
+@click.option(
+    "--remote-root",
+    default="",
+    help="Nonversioned remote root (absolute path, file backend): content "
+    "revisions live there with keep-last-N rotation, git holds only a "
+    "pointer. File targets only (text|binary).",
+)
+@click.option(
+    "--remote-backend",
+    default="file",
+    show_default=True,
+    help="Remote backend (v1 supports 'file' only).",
+)
+@click.option(
+    "--remote-retention",
+    type=int,
+    default=None,
+    help="Keep-last-N remote revisions (default 3). Only with --remote-root.",
+)
 @click.pass_context
 def target_add(
     ctx,
@@ -448,6 +492,9 @@ def target_add(
     encrypt,
     target_auto_commit,
     force,
+    remote_root,
+    remote_backend,
+    remote_retention,
 ):
     """Start tracking PATH from now (baseline + commit, no backfill)."""
     import shutil as _shutil
@@ -497,12 +544,35 @@ def target_add(
         retention["count"] = count
     if retention_age:
         retention["age"] = retention_age
-    if target_auto_commit and not cfg.has_limited_retention(retention):
+    want_remote = bool((remote_root or "").strip())
+    if target_auto_commit and not cfg.has_limited_retention(retention) and not want_remote:
         raise click.ClickException(
             "--auto-commit requires limited retention: "
             "pass --retention-count N (e.g. --retention-count 30) "
-            "so auto-committed revisions stay bounded"
+            "so auto-committed revisions stay bounded "
+            "(remote targets are bounded by --remote-retention instead)"
         )
+
+    # Nonversioned remote pre-validation (fail fast, before any writes).
+    from versioneer.core import remote as _rem
+
+    if (remote_backend or "file") != "file" and not want_remote:
+        raise click.ClickException(
+            f"unsupported --remote-backend {remote_backend!r} "
+            "(v1 supports 'file' only; pass --remote-root with it)"
+        )
+    if remote_retention is not None and remote_retention < 1:
+        raise click.ClickException(
+            f"invalid --remote-retention {remote_retention!r}: must be int >= 1"
+        )
+    if want_remote and retention:
+        console.print(
+            "[yellow]warn[/yellow]: git --retention-* flags are ignored for "
+            "remote targets (rotation uses --remote-retention)"
+        )
+        retention = {}
+    if want_remote and (encrypt or config.meta.encrypt):
+        raise click.ClickException("remote + encrypt=true is not supported in v1")
 
     store = cfg.store_dir(config)
     try:
@@ -531,6 +601,24 @@ def target_add(
             )
         if flex == "user" and effective_root:
             raise click.ClickException("root must not be set for user targets (flex=user)")
+
+        # Per-candidate remote setup (kind is known here).
+        remote_dict: dict = {}
+        if want_remote:
+            if kind not in ("text", "binary"):
+                raise click.ClickException(
+                    f"remote targets must be kind text|binary, got {kind!r} "
+                    "(dir/manifest remotes are not supported in v1)"
+                )
+            remote_dict = {
+                "backend": remote_backend or "file",
+                "root": remote_root,
+            }
+            if remote_retention is not None:
+                remote_dict["retention"] = remote_retention
+            errs = _rem.validate_remote_dict(remote_dict)
+            if errs:
+                raise click.ClickException("; ".join(errs))
 
         # stat / symlink state.
         # NOTE: Path.exists() returns False for BOTH missing and
@@ -575,6 +663,10 @@ def target_add(
             console.print(f"[yellow]warn[/yellow]: dangling symlink {abs_path} (follow mode)")
         elif dangling:
             console.print(f"[yellow]warn[/yellow]: dangling symlink {abs_path}")
+        if want_remote and (is_link or dangling):
+            raise click.ClickException(
+                f"remote targets must be regular files, got symlink: {abs_path}"
+            )
 
         # Wine full-prefix escape hatch: manifest-only is the default.
         # A dir that looks like a wine prefix requires --force; the preset
@@ -672,10 +764,17 @@ def target_add(
                 size_mb = 0
             warn_mb = config.meta.large_file_warn_mb or 10
             if size_mb > warn_mb:
-                console.print(
-                    f"[yellow]warn[/yellow]: large file {size_mb:.1f} MB > {warn_mb} MB — "
-                    "uses git-lfs (warn-only)"
-                )
+                if remote_dict:
+                    console.print(
+                        f"[yellow]warn[/yellow]: large file {size_mb:.1f} MB > {warn_mb} MB — "
+                        "stored on the nonversioned remote "
+                        f"(keep-last-{_rem.remote_retention(remote_dict)})"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]warn[/yellow]: large file {size_mb:.1f} MB > {warn_mb} MB — "
+                        "stored in plain git with full history (no automatic pruning)"
+                    )
 
         target = cfg.Target(
             path=stored_path,
@@ -699,6 +798,7 @@ def target_add(
             encrypt=bool(encrypt or config.meta.encrypt),
             auto_add_glob=auto_add_glob or "",
             auto_commit=bool(target_auto_commit),
+            remote=remote_dict,
         )
         errors = target.validate(config.meta.root)
         if errors:
@@ -708,11 +808,32 @@ def target_add(
                 f"[yellow]warn[/yellow]: {stored_path}: {cfg.AUTO_COMMIT_SPACE_WARNING}"
             )
 
-        # stage artifact copy inside the store repo
+        # stage artifact: remote targets push a blob + write a git pointer,
+        # git targets copy into the store repo.
         if effective_root:
             rel = Path(stored_path)
         else:
             rel = _mon.artifact_rel("", abs_path, flex, "")
+        if remote_dict:
+            try:
+                data = abs_path.read_bytes()
+            except OSError:
+                try:
+                    data = _elev.read_bytes_via_sudo(abs_path)
+                except OSError as e2:
+                    raise click.ClickException(
+                        f"cannot read {abs_path} for remote push: {e2} — "
+                        "ensure sudo access (you will be prompted)"
+                    )
+            _push_remote_revision(store, target, rel.as_posix(), data, digest)
+            config.targets.append(target)
+            added += 1
+            console.print(
+                f"[green]tracking[/green] {stored_path} (kind={kind} flex={flex} "
+                f"remote={remote_dict['backend']}:{remote_dict['root']} "
+                f"keep={_rem.remote_retention(remote_dict)} hash={digest[:19]}…)"
+            )
+            continue
         dest = store / rel
         try:
             if abs_path.is_symlink() and not follow:
@@ -807,11 +928,6 @@ def target_add(
                         )
             raise click.ClickException(msg)
 
-        if kind == "binary":
-            warn = _store.ensure_lfs(store, [rel.as_posix()])
-            if warn:
-                console.print(f"[yellow]warn[/yellow]: {warn}")
-
         # ITEM 2: encrypt in store when per-target/config encrypt flag set.
         # Warn-only when sops/age absent — never blocks tracking.
         if bool(getattr(target, "encrypt", False)):
@@ -840,18 +956,14 @@ def target_add(
     for t in config.targets[-added:]:
         assert isinstance(t, cfg.Target)
         if effective_root:
-            rels.append(Path(t.path).as_posix())
+            base = Path(t.path)
         else:
-            rels.append(_mon.artifact_rel("", Path(t.abs_path), t.flex, "").as_posix())
-    if kind_opt == "binary" or any(
-        isinstance(t, cfg.Target) and t.kind == "binary" for t in config.targets[-added:]
-    ):
-        ga_warn = _store.ensure_lfs(store, rels)
-        if ga_warn:
-            console.print(f"[yellow]warn[/yellow]: {ga_warn}")
-    # .gitattributes is created by ensure_lfs at config create time (and by
-    # ensure_lfs above for binaries). Stage it whenever present so it never
-    # lingers as untracked dirt that pollutes future commits.
+            base = _mon.artifact_rel("", Path(t.abs_path), t.flex, "")
+        if getattr(t, "remote", None):
+            base = _rem.pointer_rel_for(base)
+        rels.append(base.as_posix())
+    # Stage a pre-existing user-owned .gitattributes (never created by us since
+    # LFS removal) so it never lingers as untracked dirt that pollutes commits.
     if (store / ".gitattributes").exists() and ".gitattributes" not in rels:
         rels = rels + [".gitattributes"]
     if (store / cfg.SNAPSHOT_NAME).exists() and cfg.SNAPSHOT_NAME not in rels:
@@ -885,9 +997,17 @@ def target_list(ctx):
     table.add_column("hash")
     table.add_column("owner/mode")
     table.add_column("auto-commit")
+    table.add_column("remote")
     for t in config.targets:
         assert isinstance(t, cfg.Target)
         short = (t.hash[:19] + "…") if len(t.hash) > 19 else t.hash
+        rem = getattr(t, "remote", None) or {}
+        if rem:
+            from versioneer.core import remote as _rem_l
+
+            remote_s = f"{rem.get('backend', 'file')}:{rem.get('root', '')} keep={_rem_l.remote_retention(rem)}"
+        else:
+            remote_s = "-"
         table.add_row(
             t.path,
             t.kind,
@@ -895,6 +1015,7 @@ def target_list(ctx):
             short,
             f"{t.owner}/{t.mode}",
             "yes" if bool(getattr(t, "auto_commit", False)) else "no",
+            remote_s,
         )
     console.print(table)
 
@@ -923,16 +1044,37 @@ def target_list(ctx):
     default=False,
     help="Clear the retention policy (refused while auto-commit is enabled).",
 )
+@click.option(
+    "--remote-root",
+    default=None,
+    help="Attach a nonversioned remote (absolute path, file backend): migrates "
+    "git content to the remote (file targets only).",
+)
+@click.option(
+    "--remote-retention",
+    type=int,
+    default=None,
+    help="Keep-last-N remote revisions (attaches with --remote-root, "
+    "retunes an attached remote).",
+)
+@click.option(
+    "--clear-remote",
+    is_flag=True,
+    default=False,
+    help="Detach the remote: migrates content back into git.",
+)
 @click.pass_context
 def target_set(
     ctx, path, target_auto_commit, retention_shorthand, retention_count, retention_age,
-    clear_retention,
+    clear_retention, remote_root, remote_retention, clear_remote,
 ):
-    """Toggle auto-commit / retention on an already tracked target.
+    """Toggle auto-commit / retention / remote on an already tracked target.
 
     \b
     versioneer -C saves target set saves/slot1.sav --auto-commit --retention-count 30
     versioneer -C saves target set saves/slot1.sav --no-auto-commit
+    versioneer -C saves target set saves/slot1.sav --remote-root /mnt/d --remote-retention 5
+    versioneer -C saves target set saves/slot1.sav --clear-remote
     """
     from versioneer.core import monitor as _mon
     from versioneer.core import store as _store
@@ -955,17 +1097,243 @@ def target_set(
         raise click.ClickException(f"not tracked: {path!r}")
     assert isinstance(target, cfg.Target)
 
-    if (
-        target_auto_commit is None
-        and retention_shorthand is None
-        and retention_count is None
-        and retention_age is None
-        and not clear_retention
-    ):
+    is_remote = bool(getattr(target, "remote", None) or {})
+    git_flags = (
+        target_auto_commit is not None
+        or retention_shorthand is not None
+        or retention_count is not None
+        or bool(retention_age)
+        or clear_retention
+    )
+    remote_flags = (
+        remote_root is not None or remote_retention is not None or clear_remote
+    )
+    if not git_flags and not remote_flags:
         raise click.ClickException(
             "nothing to change: pass --auto-commit/--no-auto-commit "
-            "and/or --retention-count N [--retention-age AGE]"
+            "and/or --retention-count N [--retention-age AGE], "
+            "and/or --remote-root PATH [--remote-retention N] / --clear-remote"
         )
+    if clear_remote and (remote_root is not None or remote_retention is not None):
+        raise click.ClickException(
+            "pass either --clear-remote or remote values, not both"
+        )
+    if remote_retention is not None and remote_retention < 1:
+        raise click.ClickException(
+            f"invalid --remote-retention {remote_retention!r}: must be int >= 1"
+        )
+    if (
+        (retention_shorthand is not None or retention_count is not None or retention_age)
+        and (is_remote or remote_root is not None)
+        and not clear_remote
+    ):
+        raise click.ClickException(
+            "git --retention-* flags don't apply to remote targets "
+            "(use --remote-retention)"
+        )
+
+    if remote_flags:
+        from versioneer.core import elevate as _elev_s
+        from versioneer.core import permissions as _perm_s
+        from versioneer.core import remote as _rem_s
+
+        _rstore = cfg.store_dir(config)
+        _abs = _mon.live_abs_path(target.path, target.abs_path, config.meta.root or "")
+        if config.meta.root:
+            _crel = Path(target.path)
+        else:
+            _crel = _mon.artifact_rel("", _abs, target.flex, "")
+        _crel_posix = _crel.as_posix()
+
+        def _read_live() -> tuple:
+            try:
+                _data = _abs.read_bytes()
+            except OSError:
+                if _elev_s.sudo_cmd() is None:
+                    raise click.ClickException(
+                        f"cannot read {_abs} (permission denied, sudo not found)"
+                    )
+                try:
+                    _data = _elev_s.read_bytes_via_sudo(_abs)
+                except OSError as _e2:
+                    raise click.ClickException(f"cannot read {_abs}: {_e2}")
+            try:
+                _owner, _group, _mode = _perm_s.capture(
+                    _abs, follow=(target.symlink == "follow")
+                )
+            except OSError:
+                try:
+                    _owner, _group, _mode = _elev_s.stat_via_sudo(
+                        _abs, follow=(target.symlink == "follow")
+                    )
+                except OSError as _e3:
+                    raise click.ClickException(f"cannot stat {_abs}: {_e3}")
+            try:
+                _hash = _mon.hash_target(
+                    _abs, target.kind, target.symlink, list(target.ignore or [])
+                )
+            except OSError:
+                _hash = "read-error"
+            if _hash in ("missing", "read-error"):
+                try:
+                    _hash = _elev_s.hash_file_elevated(_abs, target.kind)
+                except OSError as _e4:
+                    raise click.ClickException(f"cannot hash {_abs}: {_e4}")
+            return _data, _hash, _owner, _group, _mode
+
+        if remote_root is not None:
+            if is_remote:
+                raise click.ClickException(
+                    f"{target.path} is already a remote target "
+                    "(use --clear-remote first to re-attach elsewhere)"
+                )
+            if target.kind not in ("text", "binary"):
+                raise click.ClickException(
+                    f"remote targets must be kind text|binary, got {target.kind!r}"
+                )
+            if bool(getattr(target, "encrypt", False) or config.meta.encrypt):
+                raise click.ClickException(
+                    "remote + encrypt=true is not supported in v1"
+                )
+            if _abs.is_symlink():
+                raise click.ClickException(
+                    f"remote targets must be regular files, got symlink: {_abs}"
+                )
+            _new_remote: dict = {"backend": "file", "root": remote_root}
+            if remote_retention is not None:
+                _new_remote["retention"] = remote_retention
+            _errs = _rem_s.validate_remote_dict(_new_remote)
+            if _errs:
+                raise click.ClickException("; ".join(_errs))
+            _data, _hash, _owner, _group, _mode = _read_live()
+            target.remote = _new_remote
+            _errs = target.validate(config.meta.root)
+            if _errs:
+                target.remote = {}
+                raise click.ClickException("; ".join(_errs))
+            _, _pruned = _push_remote_revision(
+                _rstore, target, _crel_posix, _data, _hash
+            )
+            target.owner, target.group, target.mode = _owner, _group, _mode
+            target.hash = _hash
+            try:
+                cfg.save(config)
+            except ValueError as e:
+                raise click.ClickException(str(e))
+            try:
+                cfg.export_snapshot(config, _rstore)
+            except (ValueError, OSError) as e:
+                console.print(f"[yellow]warn[/yellow]: snapshot export skipped: {e}")
+            try:
+                _store.stage_rm(_rstore, [_crel_posix])
+            except _store.GitError as e:
+                raise click.ClickException(
+                    f"storage move failed: {e} (TOML entry already updated)"
+                )
+            try:
+                _sha = _store.add_and_commit(
+                    _rstore,
+                    [_rem_s.pointer_rel_for(_crel).as_posix(), cfg.SNAPSHOT_NAME],
+                    f"target set {target.path} (move to remote)",
+                )
+            except _store.GitError as e:
+                raise click.ClickException(f"move commit failed: {e}")
+            console.print(
+                f"[green]moved[/green] {target.path} to remote "
+                f"file:{remote_root} "
+                f"(keep-last-{_rem_s.remote_retention(_new_remote)})"
+                + (f" [{_sha[:7]}]" if _sha else "")
+            )
+            if _pruned:
+                console.print(f"  pruned {len(_pruned)} old remote revision(s)")
+        elif remote_retention is not None:
+            if not is_remote:
+                raise click.ClickException(
+                    f"{target.path} is not a remote target "
+                    "(pass --remote-root to attach)"
+                )
+            target.remote = {**target.remote, "retention": remote_retention}
+            _errs = target.validate(config.meta.root)
+            if _errs:
+                raise click.ClickException("; ".join(_errs))
+            try:
+                cfg.save(config)
+            except ValueError as e:
+                raise click.ClickException(str(e))
+            try:
+                cfg.export_snapshot(config, _rstore)
+                try:
+                    _store.add_and_commit(
+                        _rstore,
+                        [cfg.SNAPSHOT_NAME],
+                        f"target set {target.path} "
+                        f"(remote retention {remote_retention})",
+                    )
+                except _store.GitError:
+                    pass
+            except (ValueError, OSError) as e:
+                console.print(f"[yellow]warn[/yellow]: snapshot refresh skipped: {e}")
+            try:
+                _pruned = _rem_s.prune_blobs(
+                    target.remote.get("backend", "file"),
+                    target.remote.get("root", ""),
+                    _crel_posix,
+                    remote_retention,
+                )
+            except _rem_s.RemoteError as e:
+                raise click.ClickException(str(e))
+            console.print(
+                f"[green]updated[/green] {target.path} "
+                f"(remote keep-last-{remote_retention})"
+            )
+            if _pruned:
+                console.print(f"  pruned {len(_pruned)} old remote revision(s)")
+        else:  # clear_remote: migrate content back into git
+            if not is_remote:
+                raise click.ClickException(
+                    f"{target.path} is not a remote target (nothing to detach)"
+                )
+            _data, _hash, _owner, _group, _mode = _read_live()
+            try:
+                _stage_artifact(
+                    _abs, target.kind, target.symlink,
+                    list(target.ignore or []), _rstore / _crel,
+                )
+            except OSError as e:
+                raise click.ClickException(f"cannot stage git content: {e}")
+            _pointer = _rem_s.pointer_rel_for(_crel).as_posix()
+            target.remote = {}
+            target.owner, target.group, target.mode = _owner, _group, _mode
+            target.hash = _hash
+            try:
+                cfg.save(config)
+            except ValueError as e:
+                raise click.ClickException(str(e))
+            try:
+                cfg.export_snapshot(config, _rstore)
+            except (ValueError, OSError) as e:
+                console.print(f"[yellow]warn[/yellow]: snapshot export skipped: {e}")
+            try:
+                _store.stage_rm(_rstore, [_pointer])
+            except _store.GitError as e:
+                raise click.ClickException(
+                    f"storage move failed: {e} (TOML entry already updated)"
+                )
+            try:
+                _sha = _store.add_and_commit(
+                    _rstore,
+                    [_crel_posix, cfg.SNAPSHOT_NAME],
+                    f"target set {target.path} (move to git)",
+                )
+            except _store.GitError as e:
+                raise click.ClickException(f"move commit failed: {e}")
+            console.print(
+                f"[green]moved[/green] {target.path} to git"
+                + (f" [{_sha[:7]}]" if _sha else "")
+            )
+        if not git_flags:
+            return
+
     if clear_retention and (
         retention_shorthand is not None or retention_count is not None or retention_age
     ):
@@ -984,11 +1352,14 @@ def target_set(
     if target_auto_commit is not None:
         new_auto = bool(target_auto_commit)
 
-    if new_auto and not cfg.has_limited_retention(new_retention):
+    if new_auto and not cfg.has_limited_retention(new_retention) and not (
+        bool(getattr(target, "remote", None) or {}) and not clear_remote
+    ):
         raise click.ClickException(
             "--auto-commit requires limited retention: "
             "pass --retention-count N (e.g. --retention-count 30) "
-            "so auto-committed revisions stay bounded"
+            "so auto-committed revisions stay bounded "
+            "(remote targets are bounded by --remote-retention instead)"
         )
     if clear_retention and bool(getattr(target, "auto_commit", False)) and new_auto:
         raise click.ClickException(
@@ -1051,9 +1422,15 @@ def target_remove(ctx, path):
         raise click.ClickException(f"not tracked: {path!r}")
     assert isinstance(target, cfg.Target)
     if config.meta.root:
-        rel = Path(target.path).as_posix()
+        content_rel = Path(target.path).as_posix()
     else:
-        rel = _mon.artifact_rel("", Path(target.abs_path), target.flex, "").as_posix()
+        content_rel = _mon.artifact_rel("", Path(target.abs_path), target.flex, "").as_posix()
+    if getattr(target, "remote", None):
+        from versioneer.core import remote as _rem_rm
+
+        rel = _rem_rm.pointer_rel_for(Path(content_rel)).as_posix()
+    else:
+        rel = content_rel
     config.targets = [t for t in config.targets if t is not target]
     try:
         cfg.save(config)
@@ -1073,6 +1450,12 @@ def target_remove(ctx, path):
     console.print(
         f"[yellow]untracked[/yellow] {target.path} (working file untouched, git history kept)"
     )
+    if getattr(target, "remote", None):
+        rem = target.remote
+        console.print(
+            f"  remote revisions kept at {rem.get('root', '')}/{content_rel} "
+            "(purge manually; retention no longer enforced)"
+        )
 
 
 @cli.command("status")
@@ -1116,6 +1499,8 @@ def status(ctx, host):
         detail = r["detail"]
         if r["host_skipped"]:
             detail = detail + " [wrong host]" if detail else "[wrong host]"
+        if getattr(t, "remote", None):
+            detail = (detail + " " if detail else "") + "[remote]"
         table.add_row(
             _escape(t.path),
             f"[{colors.get(state, '')}]{state}[/]" if state in colors else _escape(state),
@@ -1165,6 +1550,63 @@ def diff(ctx, target):
             console.print(
                 f"  [red]{_escape(r['state'])}[/red]: {_escape(r['detail'])} (no diff available)"
             )
+            continue
+        if getattr(t, "remote", None):
+            from versioneer.core import deploy as _dep_d
+            from versioneer.core import remote as _rem_d
+
+            rem = t.remote
+            try:
+                names = _rem_d.list_blobs(
+                    rem.get("backend", "file"), rem.get("root", ""), rel
+                )
+                if not names:
+                    raise _rem_d.RemoteError(
+                        f"no revisions on remote {rem.get('root', '')}/{rel} "
+                        "(run commit first)"
+                    )
+                blob_path = _rem_d.materialize_latest(
+                    rem.get("backend", "file"), rem.get("root", ""), rel,
+                    _dep_d.state_dir() / "remote-cache", blob=names[0],
+                )
+            except _rem_d.RemoteError as e:
+                console.print(f"  [red]remote unreachable[/red]: {_escape(str(e))}")
+                continue
+            if t.kind == "text":
+                try:
+                    live_text = r["abs_path"].read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+                except OSError as e:
+                    console.print(f"  [red]cannot read live file: {e}[/red]")
+                    continue
+                try:
+                    store_text = blob_path.read_bytes().decode(
+                        "utf-8", errors="replace"
+                    ).splitlines()
+                except OSError as e:
+                    console.print(f"  [red]cannot read remote blob: {e}[/red]")
+                    continue
+                dlines = list(
+                    difflib.unified_diff(
+                        store_text, live_text,
+                        f"remote/{names[0]}", f"live/{t.path}", lineterm="",
+                    )
+                )
+                if not dlines:
+                    console.print(f"  in sync with remote latest ({names[0]})")
+                    continue
+                for line in dlines:
+                    console.print(f"  {line}", markup=False, highlight=False)
+            else:  # binary remote: stat summary against the latest blob
+                try:
+                    size = r["abs_path"].stat().st_size if r["abs_path"].exists() else -1
+                except OSError:
+                    size = -1
+                console.print(
+                    f"  binary (remote {names[0]}): {r['current_hash'][:19]}… "
+                    f"size={size} bytes (baseline {t.hash[:19]}…)"
+                )
             continue
         if t.kind == "text":
             head = _store.show_head_file(store, rel)
@@ -1320,6 +1762,27 @@ def log(ctx, target, number):
         assert isinstance(t, cfg.Target)
         abs_p = _mon.live_abs_path(t.path, t.abs_path, config.meta.root or "")
         rel = _mon.store_rel_for(t.path, abs_p, t.flex, config.meta.root or "").as_posix()
+        if getattr(t, "remote", None):
+            # Remote targets: revisions are blobs on the remote (newest first).
+            # Unreachable remote falls back to the git pointer history.
+            from versioneer.core import remote as _rem_l
+
+            rem = t.remote
+            try:
+                names = _rem_l.list_blobs(
+                    rem.get("backend", "file"), rem.get("root", ""), rel
+                )
+            except _rem_l.RemoteError as e:
+                console.print(
+                    f"[yellow]warn[/yellow]: remote unreachable ({e}); "
+                    "showing pointer history"
+                )
+                names = []
+            if names:
+                for blob_name in names[: max(1, number)]:
+                    console.print(blob_name)
+                return
+            rel = _rem_l.pointer_rel_for(Path(rel)).as_posix()
     lines = _store.log_lines(store, number, rel)
     if not lines:
         console.print("(no commits yet)" if not rel else f"(no commits yet for {target})")
@@ -1335,8 +1798,8 @@ def log(ctx, target, number):
     "--prune-retention",
     is_flag=True,
     default=False,
-    help="Opt-in: run local `git lfs prune` when retention "
-    "exceeds (history kept by default, never squashes).",
+    help="Deprecated (LFS removed): warn-only, prints manual-prune "
+    "guidance. History kept, never squashes.",
 )
 @click.argument("targets", nargs=-1)
 @click.pass_context
@@ -1423,6 +1886,86 @@ def commit(ctx, message, all_targets, targets, prune_retention):
                 continue
         abs_path = r["abs_path"]
         rel = r["rel"]
+        if getattr(t, "remote", None):
+            # Remote target: push a new blob, rotate, refresh baseline +
+            # git pointer. Git retention advisories don't apply (git holds
+            # one pointer, not content history).
+            from versioneer.core import remote as _rem_c
+
+            rem = t.remote
+            if abs_path.is_symlink():
+                console.print(
+                    f"[red]error[/red]: {t.path}: remote targets must be "
+                    "regular files (symlink found)"
+                )
+                skipped.append(f"{t.path} remote-symlink")
+                continue
+            try:
+                blob_data = abs_path.read_bytes()
+            except OSError:
+                if _elev_c.sudo_cmd() is None:
+                    console.print(
+                        f"[red]error[/red]: {t.path}: cannot read {abs_path} "
+                        "(permission denied, sudo not found)"
+                    )
+                    skipped.append(f"{t.path} read-error")
+                    continue
+                try:
+                    blob_data = _elev_c.read_bytes_via_sudo(abs_path)
+                    console.print(
+                        f"[yellow]warn[/yellow]: {t.path}: elevated read via sudo"
+                    )
+                except OSError as e2:
+                    console.print(
+                        f"[red]error[/red]: {t.path}: cannot read {abs_path}: {e2}"
+                    )
+                    skipped.append(f"{t.path} read-error")
+                    continue
+            follow = t.symlink == "follow"
+            try:
+                owner, group, mode = _perm.capture(abs_path, follow=follow)
+            except OSError:
+                try:
+                    owner, group, mode = _elev_c.stat_via_sudo(abs_path, follow=follow)
+                except OSError as e:
+                    console.print(
+                        f"[red]error[/red]: {t.path}: cannot stat after read: {e}"
+                    )
+                    skipped.append(f"{t.path} stat-error")
+                    continue
+            try:
+                new_hash = _mon.hash_target(
+                    abs_path, t.kind, t.symlink, list(t.ignore or [])
+                )
+            except OSError:
+                new_hash = "read-error"
+            if new_hash in ("missing", "read-error"):
+                try:
+                    new_hash = _elev_c.hash_file_elevated(abs_path, t.kind)
+                except OSError as e:
+                    console.print(
+                        f"[red]error[/red]: {t.path}: cannot hash after read: {e}"
+                    )
+                    skipped.append(f"{t.path} hash-error")
+                    continue
+            try:
+                _, pruned = _push_remote_revision(
+                    store, t, rel.as_posix(), blob_data, new_hash
+                )
+            except click.ClickException as e:
+                console.print(f"[red]error[/red]: {t.path}: remote push failed: {e}")
+                skipped.append(f"{t.path} remote-error")
+                continue
+            t.owner, t.group, t.mode = owner, group, mode
+            t.hash = new_hash
+            rels.append(_rem_c.pointer_rel_for(rel).as_posix())
+            committed.append(t.path)
+            if pruned:
+                console.print(
+                    f"  {t.path}: pruned {len(pruned)} old remote revision(s) "
+                    f"(keep-last-{_rem_c.remote_retention(rem)})"
+                )
+            continue
         dest = store / rel
         # warn-only lints (same as add)
         if t.kind == "text" and abs_path.is_file() and not abs_path.is_symlink():
@@ -1437,7 +1980,8 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             if size_mb > warn_mb:
                 console.print(
                     f"[yellow]warn[/yellow]: {t.path}: large file {size_mb:.1f} MB > "
-                    f"{warn_mb} MB — uses git-lfs (warn-only)"
+                    f"{warn_mb} MB — stored in plain git with full history "
+                    "(no automatic pruning)"
                 )
             # locked-file safe copy-then-hash notice
             try:
@@ -1471,10 +2015,6 @@ def commit(ctx, message, all_targets, targets, prune_retention):
                 console.print(f"[red]error[/red]: {t.path}: cannot stage artifact: {e}")
                 skipped.append(f"{t.path} stage-error")
                 continue
-        if t.kind == "binary":
-            warn = _store.ensure_lfs(store, [rel.as_posix()])
-            if warn:
-                console.print(f"[yellow]warn[/yellow]: {warn}")
         # ITEM 2: encrypt staged artifact when per-target/config encrypt set.
         # Warn-only when sops/age absent — never blocks commit.
         if bool(getattr(t, "encrypt", False) or config.meta.encrypt):
@@ -1507,10 +2047,11 @@ def commit(ctx, message, all_targets, targets, prune_retention):
                 continue
         rels.append(rel.as_posix())
         committed.append(t.path)
-        # retention advisory (non-destructive, Q3 decision c: warn by default,
-        # opt-in prune via --prune-retention; never silent squash so
-        # plan.json hashes + remove history stay intact).
-        if t.retention:
+        # retention advisory (warn-only since LFS removal: no automatic
+        # pruning; never silent squash so plan.json hashes + remove
+        # history stay intact). Skipped for remote targets (rotation is
+        # enforced on the remote, not in git).
+        if t.retention and not getattr(t, "remote", None):
             rel_posix = rel.as_posix()
             n = _store.count_artifact_commits(store, rel_posix)
             oldest: int | None = None
@@ -1519,14 +2060,7 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             warn_r = _store.retention_warning(n + 1, t.retention, oldest)
             if warn_r:
                 console.print(f"[yellow]warn[/yellow]: {t.path}: {warn_r}")
-                console.print(
-                    f"  {_store.prune_guidance(rel_posix, t.retention)}"
-                    + (
-                        ""
-                        if prune_retention
-                        else " (pass --prune-retention for local `git lfs prune`)"
-                    )
-                )
+                console.print(f"  {_store.prune_guidance(rel_posix, t.retention)}")
 
     if not committed:
         console.print(
@@ -1535,12 +2069,6 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             else "nothing committed (see errors above)"
         )
         return
-    if any(
-        isinstance(t, cfg.Target) and t.kind == "binary" for t in selected if t.path in committed
-    ):
-        ga_warn = _store.ensure_lfs(store, rels)
-        if ga_warn:
-            console.print(f"[yellow]warn[/yellow]: {ga_warn}")
     if (store / ".gitattributes").exists() and ".gitattributes" not in rels:
         rels = rels + [".gitattributes"]
     try:
@@ -1574,8 +2102,13 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             f"(store content unchanged): {', '.join(committed)}"
         )
     if prune_retention:
-        # Opt-in prune only: local `git lfs prune`, never history rewrite,
-        # so plan.json hashes stay valid. Warn-only per target.
+        # Deprecated since LFS removal: no automatic pruning exists, so this
+        # only prints manual-prune guidance for over-retention targets.
+        # History kept, never rewritten.
+        console.print(
+            "[yellow]warn[/yellow]: --prune-retention is deprecated (LFS removed): "
+            "no automatic pruning; history kept"
+        )
         for t in selected:
             assert isinstance(t, cfg.Target)
             if t.path not in committed or not t.retention:
@@ -1585,8 +2118,7 @@ def commit(ctx, message, all_targets, targets, prune_retention):
             abs_p = _mon2.live_abs_path(t.path, t.abs_path, config.meta.root or "")
             rel_p = _mon2.store_rel_for(t.path, abs_p, t.flex, config.meta.root or "").as_posix()
             if _store.check_retention(store, rel_p, t.retention):
-                result = _store.prune_retention(store, rel_p, t.retention)
-                console.print(f"[yellow]prune[/yellow]: {t.path}: {result}")
+                console.print(f"  {t.path}: {_store.prune_guidance(rel_p, t.retention)}")
     for s in skipped:
         console.print(f"  skipped: {s}")
 
@@ -1793,7 +2325,7 @@ def service_grp():
 def service_install(do_enable):
     """Install user + system units and timers (no sudo needed).
 
-    Warn-only preflight: git-lfs check, linger hint, completions check,
+    Warn-only preflight: linger hint, completions check,
     sops/age optional check. Writes are idempotent; timer enable never fails
     the install (use `service enable` to retry verbosely).
     """
@@ -2461,8 +2993,6 @@ def doctor(ctx, secrets_only):
         raise click.ClickException(f"config {name!r} not found in {cfg.config_dir()}")
     if not names:
         console.print(f"no configs in {cfg.config_dir()} (use: versioneer config create --help)")
-        if not _store.lfs_available():
-            console.print("[yellow]warn[/yellow]: git-lfs not found (sudo pacman -S git-lfs)")
         return
 
     errors = 0
@@ -2480,8 +3010,14 @@ def doctor(ctx, secrets_only):
         console.print(
             f"[bold]{cname}[/bold] storage={store} upstream={conf.meta.upstream or '(none)'}"
         )
-        if not _store.lfs_available():
-            console.print("  [yellow]warn[/yellow]: git-lfs not found (binary targets need it)")
+        if any(
+            isinstance(t, cfg.Target) and t.kind == "binary" and not getattr(t, "remote", None)
+            for t in conf.targets
+        ):
+            console.print(
+                "  [yellow]warn[/yellow]: binary targets live in plain git with full "
+                "history (LFS removed, no automatic pruning)"
+            )
             warnings += 1
         if not _store.is_repo(store):
             console.print(f"  [red]error[/red]: store is not a git repo: {store}")
@@ -2550,17 +3086,39 @@ def doctor(ctx, secrets_only):
                     f"not on PATH: {t.on_deploy.split()[0]}"
                 )
                 warnings += 1
-            if t.kind == "binary" and t.retention:
+            if t.kind == "binary" and t.retention and not getattr(t, "remote", None):
                 n = _store.count_artifact_commits(store, r["rel"].as_posix())
                 w = _store.retention_warning(n, t.retention)
                 if w:
                     console.print(f"  [yellow]warn[/yellow] {t.path}: {w}")
                     warnings += 1
+            if getattr(t, "remote", None):
+                # Remote revision count vs keep-last-N (best-effort, warn-only;
+                # unreachable remotes are skipped, never errors).
+                from versioneer.core import remote as _rem_doc
+
+                rem = t.remote
+                try:
+                    names = _rem_doc.list_blobs(
+                        rem.get("backend", "file"), rem.get("root", ""),
+                        r["rel"].as_posix(),
+                    )
+                    keep = _rem_doc.remote_retention(rem)
+                    if len(names) > keep:
+                        console.print(
+                            f"  [yellow]warn[/yellow] {t.path}: remote holds "
+                            f"{len(names)} revisions, keep-last-{keep} "
+                            "(rotation applies on next commit)"
+                        )
+                        warnings += 1
+                except _rem_doc.RemoteError:
+                    pass
             if bool(getattr(t, "auto_commit", False)):
-                if not cfg.has_limited_retention(getattr(t, "retention", {})):
+                if not cfg.retention_bounded(t):
                     console.print(
                         f"  [red]error[/red] {t.path}: auto_commit=true "
-                        "requires limited retention (set retention.count >= 1)"
+                        "requires limited retention (set retention.count >= 1 "
+                        "or use a remote target)"
                     )
                     errors += 1
                 else:

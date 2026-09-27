@@ -30,8 +30,8 @@ _versioneer_complete() {
           return 0
         fi
         case "${words[2]}" in
-          add) COMPREPLY=($(compgen -W "--root --kind --flex --interest --glob --auto-add-glob --ignore --symlink --machines --retention --retention-count --retention-age --template --no-template --on-deploy --deploy-path --check-interval --encrypt --no-encrypt --auto-commit --no-auto-commit --force -h --help" -- "$cur")); return 0 ;;
-          set) COMPREPLY=($(compgen -W "--auto-commit --no-auto-commit --retention --retention-count --retention-age --clear-retention -h --help" -- "$cur")); return 0 ;;
+          add) COMPREPLY=($(compgen -W "--root --kind --flex --interest --glob --auto-add-glob --ignore --symlink --machines --retention --retention-count --retention-age --template --no-template --on-deploy --deploy-path --check-interval --encrypt --no-encrypt --auto-commit --no-auto-commit --force --remote-root --remote-backend --remote-retention -h --help" -- "$cur")); return 0 ;;
+          set) COMPREPLY=($(compgen -W "--auto-commit --no-auto-commit --retention --retention-count --retention-age --clear-retention --remote-root --remote-retention --clear-remote -h --help" -- "$cur")); return 0 ;;
         esac
         ;;
       service)

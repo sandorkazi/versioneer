@@ -1,7 +1,7 @@
 """ITEM 7 — per-target retention={count,age} (Q3 decision c).
 
-Policy: warn by default + opt-in prune. History is always kept by
-default; this suite asserts we never silently squash (no filter-repo /
+Policy: warn-only (automatic pruning was removed with LFS). History is
+always kept; this suite asserts we never silently squash (no filter-repo /
 rebase) and that plan.json hashes stay valid (history intact).
 """
 
@@ -84,18 +84,13 @@ def test_retention_warning_age():
 def test_prune_guidance_mentions_manual_only():
     g = store_mod.prune_guidance("a.bin", {"count": 3, "age": "30d"})
     assert "git log" in g
-    assert "git lfs prune" in g
-    assert "--prune-retention" in g
     assert "filter-repo" in g and "manual-only" in g
     assert "plan.json" in g
+    # no LFS mechanism references (plan-doc pointer is fine, mechanism is not)
+    assert "git lfs" not in g.lower()
+    assert "filter=lfs" not in g.lower()
     for forbidden in ("squash", "rebase", "history rewrite"):
         assert forbidden not in g.lower()
-
-
-def test_prune_retention_warn_only_without_lfs(tmp_path, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda _: None)
-    out = store_mod.prune_retention(tmp_path, "a.bin", {"count": 3})
-    assert "history kept" in out
 
 
 def test_check_retention_real_repo(tmp_path):
@@ -137,13 +132,13 @@ def test_commit_warns_and_keeps_history(tmp_path, monkeypatch):
     r = runner.invoke(cli, ["-C", "rh", "commit", str(f), "-m", "v2"])
     assert r.exit_code == 0, r.output
     assert "retention" in r.output  # warn by default
-    assert "lfs prune" in r.output  # documented hint
+    assert "filter-repo" in r.output  # manual-prune guidance hint
     # history kept: both commits visible (no squash)
     log = runner.invoke(cli, ["-C", "rh", "log", str(f)]).output
     assert "track" in log and "v2" in log
 
 
-def test_commit_prune_retention_opt_in(tmp_path, monkeypatch):
+def test_commit_prune_retention_deprecated_warn_only(tmp_path, monkeypatch):
     monkeypatch.setenv("VERSIONEER_CONFIG_DIR", str(tmp_path / "cfg"))
     runner = CliRunner()
     _make(runner, tmp_path, "rp")
@@ -155,7 +150,7 @@ def test_commit_prune_retention_opt_in(tmp_path, monkeypatch):
     r = runner.invoke(cli, ["-C", "rp", "commit", str(f), "-m", "v2",
                             "--prune-retention"])
     assert r.exit_code == 0, r.output
-    assert "retention" in r.output
-    # opt-in prune ran (or warn-only without LFS) but history still intact
+    assert "deprecated" in r.output  # flag kept, no automatic pruning
+    # history still intact
     log = runner.invoke(cli, ["-C", "rp", "log", str(f)]).output
     assert "track" in log and "v2" in log

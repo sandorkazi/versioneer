@@ -41,14 +41,6 @@ def test_store_log_empty_and_missing(tmp_path):
     assert store_mod.log_lines(tmp_path / "nope-store") == []
 
 
-def test_store_ensure_lfs_warns_without_binary(tmp_path, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda _: None)
-    store = tmp_path / "s"
-    store.mkdir()
-    warn = store_mod.ensure_lfs(store, ["x.bin"])
-    assert "git-lfs" in warn
-
-
 def test_config_dir_xdg(tmp_path, monkeypatch):
     monkeypatch.delenv("VERSIONEER_CONFIG_DIR", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))

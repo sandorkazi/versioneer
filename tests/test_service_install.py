@@ -1,7 +1,6 @@
 """ITEM 8: `service install` full preflight (extends partial user-unit write).
 
 - install writes user service+timer and stages system units
-- warns (warn-only, exit 0) when git-lfs is missing (mocked)
 - idempotent: second run overwrites with identical content, exit 0
 - linger hint, completions check, sops/age optional check, timer enable
 """
@@ -49,15 +48,12 @@ def test_install_writes_service_and_timer(tmp_path, monkeypatch):
     assert "systemctl --user enable --now versioneer-user.timer" in r.output
 
 
-def test_install_warns_when_lfs_missing(tmp_path, monkeypatch):
+def test_install_preflight_has_no_lfs_warning(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
-    from versioneer.core import store as _store
-
-    monkeypatch.setattr(_store, "lfs_available", lambda: False)
     r = CliRunner().invoke(cli, ["service", "install"])
     assert r.exit_code == 0, r.output
-    assert "git-lfs" in r.output
-    # units are still written (warn-only, never blocks)
+    assert "lfs" not in r.output.lower()
+    # units are still written
     assert (tmp_path / "xdg" / "systemd" / "user" / "versioneer-user.service").exists()
 
 
