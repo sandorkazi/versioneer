@@ -1479,6 +1479,49 @@ def status(ctx, host):
     if not results:
         console.print(f"no targets in config {name!r} (use: target add --help)")
         return
+    # Distinct remote locations (first-seen order) for the marker legend.
+    # Git-tracked targets resolve to the config upstream (or the local store
+    # when there is no upstream); file-backend targets resolve to their
+    # remote root. Each gets a TUI marker (circled numbers) prefixed to the
+    # path in the table and resolved at the bottom. The marker rides on the
+    # path column (not a separate column) so narrow terminals keep wrapping
+    # behavior identical to before.
+    _markers = [
+        "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+        "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+    ]
+
+    def _marker_for(idx: int) -> str:
+        if 0 <= idx < len(_markers):
+            return _markers[idx]
+        return f"[R{idx + 1}]"
+
+    upstream = (config.meta.upstream or "").strip()
+    git_label = f"git {upstream}" if upstream else f"local store {store} (no upstream)"
+    git_key = ("git", upstream if upstream else f"local:{store}")
+    remote_order: list[tuple] = []
+    remote_labels: dict[tuple, str] = {}
+    remote_counts: dict[tuple, int] = {}
+
+    def _remote_key(t) -> tuple:
+        rem = getattr(t, "remote", None) or {}
+        if rem:
+            backend = str(rem.get("backend", "file") or "file")
+            root = str(rem.get("root", "") or "")
+            return ("remote", backend, root)
+        return git_key
+
+    for r in results:
+        key = _remote_key(r["target"])
+        if key not in remote_labels:
+            remote_order.append(key)
+            if key == git_key:
+                remote_labels[key] = git_label
+            else:
+                _, backend, root = key
+                remote_labels[key] = f"{backend} {root}" if root else backend
+        remote_counts[key] = remote_counts.get(key, 0) + 1
+    marker_by_key = {key: _marker_for(i) for i, key in enumerate(remote_order)}
     table = Table(title=f"status {name}")
     table.add_column("path")
     table.add_column("state")
@@ -1501,12 +1544,19 @@ def status(ctx, host):
             detail = detail + " [wrong host]" if detail else "[wrong host]"
         if getattr(t, "remote", None):
             detail = (detail + " " if detail else "") + "[remote]"
+        marker = marker_by_key.get(_remote_key(t), "")
         table.add_row(
-            _escape(t.path),
+            _escape(f"{marker} {t.path}".strip()),
             f"[{colors.get(state, '')}]{state}[/]" if state in colors else _escape(state),
             _escape(detail),
         )
     console.print(table)
+    console.print("Remotes:")
+    for key in remote_order:
+        console.print(
+            f"  {marker_by_key[key]} {_escape(remote_labels[key])} "
+            f"({remote_counts.get(key, 0)} target(s))"
+        )
 
 
 @cli.command("diff")

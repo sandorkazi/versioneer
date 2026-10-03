@@ -162,7 +162,10 @@ nonversioned remote instead of git (`target add --remote-root <abs-path>`
 Git holds only a small pointer file; content revisions live under
 `<root>/<artifact-rel>/` with keep-last-N rotation enforced at commit time
 — exactly N revisions, unlike git history which keeps everything. `status`
-shows `[remote]`, `log` lists blob revisions, `diff`/`deploy` fetch the
+shows `[remote]` plus a marker (①②…) next to the path, with the
+`Remotes:` legend below resolving each marker to its location
+(`git <upstream>` for git-tracked targets, `<backend> <root>` for remote
+targets), `log` lists blob revisions, `diff`/`deploy` fetch the
 latest blob (offline-safe errors when the remote is unreachable).
 `target set` attaches/retunes/detaches
 (`--remote-root/--remote-retention/--clear-remote`); `target remove` keeps
@@ -421,6 +424,8 @@ refused on remote targets. `target list` shows `auto-commit` and `remote` column
 
 ```bash
 versioneer -C hypr status [--host HOST]  # modified|perm-drift|missing|untracked|read-error|clean
+                                     # + remote markers (①②…) with a Remotes: legend below
+                                     #   (git <upstream> vs file <root> per target)
 versioneer -C hypr diff              # unified diff (text), stat summary (binary/dir), recipe preview (manifest)
 versioneer -C hypr diff <target>
 versioneer -C hypr log [-n 10]       # git log for the store
