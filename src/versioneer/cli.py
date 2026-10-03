@@ -2673,11 +2673,99 @@ def bootstrap(upstream, all_configs, to_dir, host, dry_run, yes):
                     console.print(f"[red]error[/red]: clone failed for {n}: {e}")
                     continue
             console.print(f"[bold]{n}[/bold]: deploying {len(conf.targets)} target(s)")
+            if not conf.targets and n == "default":
+                console.print(
+                    "  [yellow]warn[/yellow]: 'default' is empty (abandoned "
+                    "'vers init'?) — run "
+                    "`versioneer config remove -C default` to clean up"
+                )
             _deploy_config(n)
         return
 
     assert upstream
     cname = _name_from_url(upstream)
+    # Empty env: single-config users expect `default`; multi-config users
+    # expect the URL-derived name. Ask on interactive TTYs (default: yes),
+    # keep the derived name otherwise (scripts/tests/--yes/--dry-run stay
+    # deterministic).
+    if cname != "default" and not cfg.list_configs():
+        if dry_run:
+            console.print(
+                f"no configs yet — name would be {cname!r} (derived from URL); "
+                "interactive runs are offered 'default' instead"
+            )
+        elif not yes:
+            try:
+                import sys as _sys
+
+                if _sys.stdin.isatty():
+                    console.print(
+                        f"no configs yet — derived name would be {cname!r}."
+                    )
+                    if click.confirm(
+                        "Use 'default' as the config name instead?",
+                        default=True,
+                    ):
+                        cname = "default"
+            except (OSError, click.Abort):
+                pass
+    # Abandoned `vers init` guard: an empty `default` (0 targets) shadows
+    # the -C fallback, so a bootstrap beside it surprises ("wanted default").
+    # Offer to remove the dead TOML (store dir kept, like `config remove`).
+    if cname != "default" and cfg.config_path("default").exists():
+        try:
+            _abandoned = cfg.is_abandoned_init(cfg.load("default"))
+        except (FileNotFoundError, ValueError, OSError):
+            _abandoned = False
+        if _abandoned:
+            _def_path = cfg.config_path("default")
+            if dry_run:
+                console.print(
+                    "[yellow]warn[/yellow]: 'default' looks like an abandoned "
+                    f"'vers init' (empty, 0 targets at {_def_path}) — "
+                    "it shadows the -C fallback; "
+                    "dry-run: would offer removal (use --yes to auto-remove)"
+                )
+            elif yes:
+                try:
+                    _def_path.unlink()
+                    console.print(
+                        "[yellow]removed[/yellow] abandoned 'default' init "
+                        f"({_def_path}) — store dir kept"
+                    )
+                except OSError as e:
+                    console.print(
+                        f"[yellow]warn[/yellow]: cannot remove abandoned "
+                        f"'default' ({e}); run "
+                        "`versioneer config remove -C default` manually"
+                    )
+            else:
+                console.print(
+                    "[yellow]warn[/yellow]: 'default' looks like an abandoned "
+                    f"'vers init' (empty, 0 targets at {_def_path}) — "
+                    "it shadows the -C fallback. "
+                    "Run `versioneer config remove -C default` to clean it up."
+                )
+                try:
+                    import sys as _sys
+
+                    if _sys.stdin.isatty():
+                        if click.confirm(
+                            "Remove abandoned 'default' config now? (store dir kept)",
+                            default=False,
+                        ):
+                            try:
+                                _def_path.unlink()
+                                console.print(
+                                    "[yellow]removed[/yellow] abandoned 'default' "
+                                    f"({_def_path})"
+                                )
+                            except OSError as e:
+                                console.print(
+                                    f"[yellow]warn[/yellow]: removal failed ({e})"
+                                )
+                except (OSError, click.Abort):
+                    pass
     import os as _os
 
     from versioneer.core import elevate as _elev_b
@@ -3010,6 +3098,17 @@ def doctor(ctx, secrets_only):
         console.print(
             f"[bold]{cname}[/bold] storage={store} upstream={conf.meta.upstream or '(none)'}"
         )
+        if not conf.targets:
+            console.print(
+                "  [yellow]warn[/yellow]: no targets tracked"
+                + (
+                    " — abandoned 'vers init'? run "
+                    "`versioneer config remove -C default` to clean up"
+                    if cname == "default"
+                    else ""
+                )
+            )
+            warnings += 1
         if any(
             isinstance(t, cfg.Target) and t.kind == "binary" and not getattr(t, "remote", None)
             for t in conf.targets
