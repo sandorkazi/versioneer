@@ -458,6 +458,28 @@ def list_configs() -> list[str]:
     return sorted(p.stem for p in d.glob("*.toml"))
 
 
+def is_abandoned_init(config: Config) -> bool:
+    """True when a config looks like an abandoned `vers init`.
+
+    `init` creates an empty `default` config (0 targets). Left alone it
+    shadows the `-C` fallback (`_require_config` prefers `default`), so
+    a later `bootstrap <url>` lands beside it instead of being used.
+    Empty `default` is useless regardless of upstream, so any 0-target
+    `default` counts as abandoned.
+    """
+    try:
+        name = config.meta.name
+    except AttributeError:
+        return False
+    if name != "default":
+        return False
+    try:
+        targets = config.targets
+    except AttributeError:
+        return False
+    return len(targets or []) == 0
+
+
 def store_dir(config: Config) -> Path:
     import os as _os
 
