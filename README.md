@@ -187,6 +187,8 @@ rejected in v1; only the `file` backend exists (ftp/drive planned).
 
 There is intentionally no `unversioned` catch-all — every state has a distinct next action.
 
+Rows are sorted by local path by default, not by tracking order.
+
 ---
 
 ## 3. Core lifecycle
@@ -426,6 +428,7 @@ refused on remote targets. `target list` shows `auto-commit` and `remote` column
 versioneer -C hypr status [--host HOST]  # modified|perm-drift|missing|untracked|read-error|clean
                                      # + remote markers (①②…) with a Remotes: legend below
                                      #   (git <upstream> vs file <root> per target)
+                                     # rows sorted by local path by default
 versioneer -C hypr diff              # unified diff (text), stat summary (binary/dir), recipe preview (manifest)
 versioneer -C hypr diff <target>
 versioneer -C hypr log [-n 10]       # git log for the store

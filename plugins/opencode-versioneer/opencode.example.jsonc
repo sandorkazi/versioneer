@@ -1,0 +1,40 @@
+{
+  // Example OpenCode configuration for the versioneer plugin.
+  // Copy to <project>/opencode.jsonc (or .opencode/opencode.jsonc) and adjust.
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      // Local path form. Published-package form would be "opencode-versioneer-plugin".
+      "package": "file:///home/masu/versioneer/plugins/opencode-versioneer",
+      "options": {
+        // Absolute path if versioneer is not on PATH; $VERSIONEER_BIN also works.
+        "binary": "versioneer",
+        // Fallback when the agent omits `config`.
+        "defaultConfig": "hypr",
+        // Set false to make every mutating tool refuse (terminal-only workflow).
+        "allowMutations": true,
+        "timeoutMs": 120000
+      }
+    }
+  ],
+  "permissions": [
+    // Read-only versioneer tools: no approval needed.
+    { "action": "versioneer_status", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_diff", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_log", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_config_list", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_config_show", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_target_list", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_doctor", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_service_check", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_deploy_preview", "resource": "*", "effect": "allow" },
+    { "action": "versioneer_bootstrap_preview", "resource": "*", "effect": "allow" },
+    // Mutating versioneer tools: ask every time.
+    { "action": "versioneer_commit", "resource": "*", "effect": "ask" },
+    { "action": "versioneer_push", "resource": "*", "effect": "ask" },
+    { "action": "versioneer_pull", "resource": "*", "effect": "ask" },
+    { "action": "versioneer_deploy_apply", "resource": "*", "effect": "ask" },
+    { "action": "versioneer_target_add", "resource": "*", "effect": "ask" },
+    { "action": "versioneer_target_remove", "resource": "*", "effect": "ask" }
+  ]
+}
