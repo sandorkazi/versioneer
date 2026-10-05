@@ -527,5 +527,11 @@ def scan_one(target, meta_root: str = "", store_dir: Path | None = None,
 
 
 def scan_all(config, store_dir: Path | None = None, host: str = "") -> list[dict]:
-    """Scan every target in a config (read-only)."""
-    return [scan_one(t, config.meta.root or "", store_dir, host) for t in config.targets]
+    """Scan every target in a config (read-only).
+
+    Results are sorted by local location (live absolute path) by default
+    so `status` displays deterministically regardless of tracking order.
+    """
+    results = [scan_one(t, config.meta.root or "", store_dir, host) for t in config.targets]
+    results.sort(key=lambda r: (str(r.get("abs_path", "")), r["target"].path))
+    return results

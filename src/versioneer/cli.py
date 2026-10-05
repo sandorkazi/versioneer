@@ -1476,6 +1476,9 @@ def status(ctx, host):
         raise click.ClickException(str(e))
     store = cfg.store_dir(config)
     results = _mon.scan_all(config, store, host or "")
+    # scan_all already sorts by local location; re-sort defensively so the
+    # displayed table never depends on TOML insertion order.
+    results = sorted(results, key=lambda r: (str(r.get("abs_path", "")), r["target"].path))
     if not results:
         console.print(f"no targets in config {name!r} (use: target add --help)")
         return
