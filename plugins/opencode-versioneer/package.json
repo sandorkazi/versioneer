@@ -5,11 +5,10 @@
   "type": "module",
   "main": "./index.ts",
   "license": "MIT",
-  "peerDependencies": {
-    "@opencode/plugin": ">=2"
+  "dependencies": {
+    "@opencode/plugin": "latest"
   },
   "devDependencies": {
-    "@opencode/plugin": ">=2",
     "typescript": "^5"
   }
 }

@@ -284,6 +284,23 @@ opencode_register() {
   else
     echo "warn: automatic OpenCode plugin registration needs a manual edit (see above)" >&2
   fi
+  # Local file:// plugins do not auto-install deps (only npm packages do),
+  # so install @opencode/plugin here when a JS package manager exists.
+  if [[ -f "$PLUGIN_SRC/package.json" ]]; then
+    if command -v bun >/dev/null 2>&1; then
+      (cd "$PLUGIN_SRC" && bun install) && echo "==> OpenCode plugin dependencies installed (bun)" \
+        || echo "warn: 'bun install' failed in $PLUGIN_SRC — run it manually" >&2
+    elif command -v npm >/dev/null 2>&1; then
+      (cd "$PLUGIN_SRC" && npm install) && echo "==> OpenCode plugin dependencies installed (npm)" \
+        || echo "warn: 'npm install' failed in $PLUGIN_SRC — run it manually" >&2
+    else
+      echo "warn: bun/npm not found — install one and run '(cd $PLUGIN_SRC && bun install)' so @opencode/plugin resolves" >&2
+    fi
+    chown_target "$PLUGIN_SRC/node_modules" 2>/dev/null || true
+    chown_target "$PLUGIN_SRC/bun.lock" 2>/dev/null || true
+    chown_target "$PLUGIN_SRC/bun.lockb" 2>/dev/null || true
+    chown_target "$PLUGIN_SRC/package-lock.json" 2>/dev/null || true
+  fi
 }
 if [[ "$OPENCODE_PLUGIN" == "no" ]]; then
   echo "==> note: --no-opencode-plugin: skipping OpenCode plugin registration"

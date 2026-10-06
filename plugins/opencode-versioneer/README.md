@@ -35,6 +35,9 @@ and adjust paths/options.
 
 Requires: `versioneer` on `PATH` (see repo `installer/install.sh --dev`),
 or set the binary explicitly via options / `$VERSIONEER_BIN`.
+Local `file://` plugins do not auto-install JS deps, so install once:
+`(cd plugins/opencode-versioneer && bun install)` (or `npm install`).
+The installer does this automatically when `bun`/`npm` is available.
 
 ## Options
 
