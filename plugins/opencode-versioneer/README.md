@@ -5,6 +5,21 @@ read-only drift review freely, mutating operations gated, deploy dry-run-first.
 
 ## Install
 
+### Via the versioneer installer (recommended)
+
+```bash
+./installer/install.sh --opencode-plugin   # register without asking
+./installer/install.sh                     # asks (default N) only if `opencode` is on PATH
+./installer/install.sh --no-opencode-plugin  # never ask, never register
+```
+
+With no flag and no `opencode` binary, the install just completes normally.
+Registration adds a `file://…/plugins/opencode-versioneer` entry to the global
+`~/.config/opencode/opencode.jsonc` (created if missing, `.bak` backup before
+ edits, skipped if already present). Restart the opencode service afterwards.
+
+### Manual
+
 Option A — local path (this repo):
 
 ```jsonc

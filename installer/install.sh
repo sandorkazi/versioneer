@@ -2,12 +2,14 @@
 # Versioneer installer — venv-only, never touches system python.
 # Usage:
 #   ./installer/install.sh [--dev] [--venv DIR] [--no-completions]
+#     [--no-system-shim] [--opencode-plugin] [--no-opencode-plugin]
 #   VERSIONEER_VENV_DIR=/custom/path ./installer/install.sh
 set -euo pipefail
 
 DEV=0
 INSTALL_COMPLETIONS=1
 SYSTEM_SHIM=1
+OPENCODE_PLUGIN="auto" # auto | yes (--opencode-plugin) | no (--no-opencode-plugin)
 VENV_DIR_ARG=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -19,9 +21,12 @@ while [[ $# -gt 0 ]]; do
     --venv=*) VENV_DIR_ARG="${1#--venv=}"; shift ;;
     --venv) VENV_DIR_ARG="${2:?--venv needs a DIR}"; shift 2 ;;
     --no-completions) INSTALL_COMPLETIONS=0; shift ;;
+    --opencode-plugin) OPENCODE_PLUGIN="yes"; shift ;;
+    --no-opencode-plugin) OPENCODE_PLUGIN="no"; shift ;;
     -h|--help)
       cat <<'EOF'
 Usage: install.sh [--dev] [--venv DIR] [--no-completions] [--no-system-shim]
+                  [--opencode-plugin] [--no-opencode-plugin]
 
 Venv-only installer: creates/uses a venv (default
 ~/.local/share/versioneer/venv, override with $VERSIONEER_VENV_DIR
@@ -46,6 +51,12 @@ two /usr/local/bin shims.
 Upstreams are set later via
 `versioneer config create --upstream <url>`; systemd units via
 `versioneer service install`.
+OpenCode plugin (plugins/opencode-versioneer): with neither
+--opencode-plugin nor --no-opencode-plugin, the installer checks for
+the `opencode` binary — absent means a normal install with no prompt;
+present means it asks (default N) whether to register the plugin in
+the global ~/.config/opencode config. --opencode-plugin registers
+without asking; --no-opencode-plugin skips silently.
 EOF
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -252,6 +263,44 @@ else
   echo "    PATH:            vers NOT on PATH (add $TARGET_HOME/.local/bin to PATH or re-login)"
 fi
 
+# 9. OpenCode plugin (optional global registration).
+# auto: no `opencode` binary -> normal install, no prompt; binary present
+# -> ask (default N). Explicit --opencode-plugin / --no-opencode-plugin
+# skips the detection/prompt entirely.
+opencode_register() {
+  PLUGIN_SRC="$REPO_ROOT/plugins/opencode-versioneer"
+  if [[ ! -f "$PLUGIN_SRC/index.ts" ]]; then
+    echo "warn: OpenCode plugin source missing ($PLUGIN_SRC) — skipping" >&2
+    return 0
+  fi
+  if ! command -v opencode >/dev/null 2>&1; then
+    echo "warn: opencode not found — registering the plugin config anyway" >&2
+    echo "      (install opencode later; entry points at $PLUGIN_SRC)" >&2
+  fi
+  if python3 "$REPO_ROOT/installer/opencode-plugin.py" \
+      "$TARGET_HOME/.config/opencode" "$PLUGIN_SRC"; then
+    chown_target "$TARGET_HOME/.config/opencode"
+    echo "==> OpenCode plugin registered (restart opencode service to load it)"
+  else
+    echo "warn: automatic OpenCode plugin registration needs a manual edit (see above)" >&2
+  fi
+}
+if [[ "$OPENCODE_PLUGIN" == "no" ]]; then
+  echo "==> note: --no-opencode-plugin: skipping OpenCode plugin registration"
+elif [[ "$OPENCODE_PLUGIN" == "yes" ]]; then
+  opencode_register
+elif command -v opencode >/dev/null 2>&1; then
+  REPLY=""
+  if [[ -t 0 ]]; then
+    read -r -p "Install the versioneer OpenCode plugin (global ~/.config/opencode)? [y/N] " REPLY || REPLY=""
+  fi
+  case "$REPLY" in
+    [yY]*) opencode_register ;;
+    *) echo "==> note: skipping OpenCode plugin (see plugins/opencode-versioneer/README.md to add it later)" ;;
+  esac
+else
+  echo "==> note: opencode not detected — skipping plugin registration (see plugins/opencode-versioneer/README.md)"
+fi
+
 echo "==> done. Activate with: source \"$VENV_DIR/bin/activate\""
 echo "==> Run: versioneer --help (shorthand: vers --help; via ~/.local/bin symlinks)"
-echo "==> Never run 'sudo pip install' — system python stays untouched."
